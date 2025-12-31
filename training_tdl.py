@@ -31,7 +31,7 @@ from mlink.channel_tdl import RtCfg, subcarrier_frequencies_centered, compute_td
 # ----------------------------
 @dataclass
 class CFG:
-    out_dir: str = "runs/wb_ex_delay"
+    out_dir: str = "runs/3072_200k_merged"
 
     # scene / grids
     frequency_hz: float = 5.21e9
@@ -51,7 +51,7 @@ class CFG:
     tx_shape: tuple[int, int, int] = (1, 5, 5)
 
     # OFDM
-    fft_size: int = 512
+    fft_size: int = 3072
     subcarrier_spacing_hz: float = 78_125.0
 
     # label generation
@@ -65,7 +65,11 @@ class CFG:
     ))
 
     # features
-    requested_features: list[str] = field(default_factory=lambda: [
+    dataset_features: list[str] = field(default_factory=lambda: [
+        "binary_walls", "electrical_distance", "cost", "height_cond"
+    ])
+
+    model_features: list[str] = field(default_factory=lambda: [
         "binary_walls", "electrical_distance", "cost", "height_cond"
     ])
 
@@ -76,19 +80,22 @@ class CFG:
     smooth_gauss_sigma: float = 1.0
 
     # dataset size
-    num_scenes: int = 20
+    num_scenes: int = 10
     train_frac: float = 0.9
-    seed: int = 0
+    seed: int = 2003
 
     # training
     batch_size: int = 8
     num_workers: int = 2
     lr: float = 2e-4
-    epochs: int = 20
+    epochs: int = 30
     base: int = 32
     groups: int = 8
     dropout: float = 0.1
     grad_clip: float = 1.0
+
+    ex_loss_thresh_ns: float = 0.5     # or 1.0
+    tau_loss_thresh_ns: float = 25.0
 
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     amp: bool = True
@@ -191,6 +198,35 @@ def tau_rms_from_taps(taps: np.ndarray, df_hz: float) -> np.ndarray:
     mu2 = p @ (t * t)
     var = np.maximum(mu2 - mu * mu, 0.0)
     return np.sqrt(var).astype(np.float32)
+
+def infer_feature_channel_counts(scene, freq_hz, features):
+    counts = {}
+    for f in features:
+        x = build_feature_tensor(scene, freq_hz, requested=[f]).astype(np.float32)
+        counts[f] = int(x.shape[1])  # channels per slice for this feature
+    return counts
+
+def build_keep_idx(dataset_features, model_features, K, feat_counts):
+    # offsets within one slice
+    offsets = {}
+    off = 0
+    for f in dataset_features:
+        offsets[f] = (off, off + feat_counts[f])
+        off += feat_counts[f]
+    c_full = off  # true channels per slice
+
+    keep_in_slice = []
+    for f in model_features:
+        a, b = offsets[f]
+        keep_in_slice.extend(range(a, b))
+
+    keep = []
+    for k in range(K):
+        base = k * c_full
+        keep.extend([base + i for i in keep_in_slice])
+
+    return np.asarray(keep, dtype=np.int64), c_full
+
 
 def make_scene(rng: np.random.Generator) -> Scene:
     H, W = cfg.img_hw
@@ -306,14 +342,32 @@ def compute_labels_for_scene(scene: Scene) -> np.ndarray:
 
     return y
 
-def compute_norm_stats(x_mm: np.memmap, y_mm: np.memmap, max_samples: int = 512, seed: int = 0):
+
+def compute_norm_stats(
+    x_mm: np.memmap,
+    y_mm: np.memmap,
+    max_samples: int = 512,
+    seed: int = 0,
+    keep_idx: np.ndarray | list[int] | None = None,
+):
+    """
+    Computes per-channel mean/std over a random subset of samples.
+
+    If keep_idx is provided, stats are computed ONLY for x[:, keep_idx, :, :],
+    and returned x_mean/x_std match that reduced channel count.
+    y stats are always computed on all y channels (no keep_idx here).
+    """
     rng = np.random.default_rng(seed)
-    n_total = x_mm.shape[0]
+    n_total = int(x_mm.shape[0])
     take = min(max_samples, n_total)
     idx = rng.choice(n_total, size=take, replace=False)
 
-    x = np.array(x_mm[idx], dtype=np.float32)  # (S,C,H,W)
-    y = np.array(y_mm[idx], dtype=np.float32)  # (S,Y,H,W)
+    x = np.array(x_mm[idx], dtype=np.float32)  # (S, Cx, H, W)
+    y = np.array(y_mm[idx], dtype=np.float32)  # (S, Cy, H, W)
+
+    if keep_idx is not None:
+        keep_idx = np.asarray(keep_idx, dtype=np.int64)
+        x = x[:, keep_idx, :, :]  # (S, Cx_keep, H, W)
 
     x_mean = torch.from_numpy(x.mean(axis=(0, 2, 3))).view(-1, 1, 1)
     x_std  = torch.from_numpy(x.std(axis=(0, 2, 3))).view(-1, 1, 1)
@@ -322,31 +376,89 @@ def compute_norm_stats(x_mm: np.memmap, y_mm: np.memmap, max_samples: int = 512,
 
     x_std = torch.clamp(x_std, min=1e-6)
     y_std = torch.clamp(y_std, min=1e-6)
-    return dict(x_mean=x_mean, x_std=x_std, y_mean=y_mean, y_std=y_std)
+
+    out = dict(x_mean=x_mean, x_std=x_std, y_mean=y_mean, y_std=y_std)
+    if keep_idx is not None:
+        out["keep_idx"] = torch.from_numpy(keep_idx)
+    return out
 
 
 class MemmapIndexDataset(Dataset):
-    def __init__(self, x_mm: np.memmap, y_mm: np.memmap, indices: np.ndarray, stats: dict, no_path_wb_db: float):
+    def __init__(
+        self,
+        x_mm,
+        y_mm,
+        indices,
+        stats,
+        no_path_wb_db: float,
+        K: int,
+        y_ch: int,
+        H: int,
+        W: int,
+        ex_loss_thresh_ns: float,
+        tau_loss_thresh_ns: float,
+        keep_idx: np.ndarray | list[int] | None = None,
+    ):
         self.x_mm = x_mm
         self.y_mm = y_mm
         self.indices = indices.astype(np.int64)
         self.stats = stats
+
         self.no_path_wb_db = float(no_path_wb_db)
+        self.K = int(K)
+        self.y_ch = int(y_ch)
+        self.H = int(H)
+        self.W = int(W)
+
+        self.ex_loss_thresh_ns = float(ex_loss_thresh_ns)
+        self.tau_loss_thresh_ns = float(tau_loss_thresh_ns)
+
+        self.keep_idx = None
+        if keep_idx is not None:
+            self.keep_idx = np.asarray(keep_idx, dtype=np.int64)
+
+        # sanity: if keep_idx is used, stats must match kept channels
+        if self.keep_idx is not None:
+            if int(self.stats["x_mean"].shape[0]) != int(self.keep_idx.shape[0]):
+                raise ValueError(
+                    f"stats['x_mean'] has {int(self.stats['x_mean'].shape[0])} channels "
+                    f"but keep_idx has {int(self.keep_idx.shape[0])}. "
+                    "Recompute norm stats with the same keep_idx."
+                )
 
     def __len__(self):
         return int(self.indices.shape[0])
 
     def __getitem__(self, i: int):
         j = int(self.indices[i])
-        x = torch.from_numpy(np.array(self.x_mm[j], dtype=np.float32))
-        y = torch.from_numpy(np.array(self.y_mm[j], dtype=np.float32))
 
-        mask = (y[0] < self.no_path_wb_db).to(torch.float32)
+        # Read full sample from memmap
+        x_np = np.array(self.x_mm[j], dtype=np.float32)  # (Cx, H, W) where Cx = K*c_in (stacked)
+        y_np = np.array(self.y_mm[j], dtype=np.float32)  # (Cy, H, W) where Cy = K*y_ch
 
+        # Apply keep_idx BEFORE normalization if requested
+        if self.keep_idx is not None:
+            x_np = x_np[self.keep_idx, :, :]  # (Cx_keep, H, W)
+
+        x = torch.from_numpy(x_np)
+        y = torch.from_numpy(y_np)
+
+        # masks from PHYSICAL y (before normalization)
+        y3 = y.view(self.K, self.y_ch, self.H, self.W)  # (K, y_ch, H, W)
+        wb  = y3[:, 0]
+        ex  = y3[:, 1]
+        tau = y3[:, 2]
+
+        mask_path = (wb < self.no_path_wb_db)
+        mask_ex   = mask_path & (ex  >= self.ex_loss_thresh_ns)
+        mask_tau  = mask_path & (tau >= self.tau_loss_thresh_ns)
+
+        # normalize
         x = (x - self.stats["x_mean"]) / self.stats["x_std"]
         y = (y - self.stats["y_mean"]) / self.stats["y_std"]
-        return x, y, mask
 
+        return x, y, mask_path.float(), mask_ex.float(), mask_tau.float()
+    
 
 def _valid_groups(ch: int, groups: int) -> int:
     g = min(groups, ch)
@@ -441,87 +553,173 @@ class UNet3(nn.Module):
 
 
 @torch.no_grad()
-def report_metrics(model, dl, stats_dev, tag="val",
-                   ex_nmse_thresh_ns=0.5, tau_nmse_thresh_ns=5.0):
+def report_metrics(model, dl, stats_dev, y_ch: int, H: int, W: int,
+                   tag="val", ex_nmse_thresh_ns=0.5, tau_nmse_thresh_ns=100.0,
+                   max_batches=None):
     model.eval()
 
-    sum_mask = 0.0
+    # counts
+    sum_path = 0.0
+    sum_ex_tail = 0.0
+    sum_tau_tail = 0.0
+    sum_nopath = 0.0
 
+    # WB
     sum_wb_mae = 0.0
     wb_nmse_num = 0.0
     wb_nmse_den = 0.0
 
-    sum_ex_mae = 0.0
-    sum_ex_mse = 0.0
+    # EX (all-path)
+    sum_ex_mae_path = 0.0
+    sum_ex_mse_path = 0.0
+
+    # EX (tail)
+    sum_ex_mae_tail = 0.0
+    sum_ex_mse_tail = 0.0
     ex_nmse_num = 0.0
     ex_nmse_den = 0.0
 
-    sum_tau_mae = 0.0
-    sum_tau_mse = 0.0
+    # EX leakage on no-path
+    sum_ex_abs_nopath = 0.0
+
+    # TAU (all-path)
+    sum_tau_mae_path = 0.0
+    sum_tau_mse_path = 0.0
+
+    # TAU (tail)
+    sum_tau_mae_tail = 0.0
+    sum_tau_mse_tail = 0.0
     tau_nmse_num = 0.0
     tau_nmse_den = 0.0
 
-    for xb, yb, mb in dl:
+    # TAU leakage on no-path
+    sum_tau_abs_nopath = 0.0
+
+    n_batches = 0
+
+    for xb, yb, m_path, m_ex, m_tau in dl:
         xb = xb.to(cfg.device, non_blocking=True)
         yb = yb.to(cfg.device, non_blocking=True)
-        mb = mb.to(cfg.device, non_blocking=True)
-        m = mb.unsqueeze(1)
+        m_path = m_path.to(cfg.device, non_blocking=True)  # (B,K,H,W)
+        m_ex   = m_ex.to(cfg.device, non_blocking=True)
+        m_tau  = m_tau.to(cfg.device, non_blocking=True)
 
         pred = model(xb)
 
+        # unnormalize to physical units
         y_mean = stats_dev["y_mean"]
         y_std  = stats_dev["y_std"]
         pred_p = pred * y_std + y_mean
         tgt_p  = yb   * y_std + y_mean
 
-        denom = m.sum().clamp_min(1.0)
-        sum_mask += denom.item()
+        B = pred_p.shape[0]
+        K = cfg.K_slices
 
-        # wb
-        wb_err = (pred_p[:,0:1] - tgt_p[:,0:1]).abs()
-        sum_wb_mae += (wb_err * m).sum().item()
+        pred_p = pred_p.view(B, K, y_ch, H, W)
+        tgt_p  = tgt_p.view(B, K, y_ch, H, W)
 
-        g_hat = torch.pow(10.0, -pred_p[:,0:1] / 10.0)
-        g_tgt = torch.pow(10.0, -tgt_p[:,0:1]  / 10.0)
-        wb_nmse_num += (((g_hat - g_tgt)**2) * m).sum().item()
-        wb_nmse_den += ((g_tgt**2) * m).sum().clamp_min(1e-12).item()
+        wb_hat = pred_p[:, :, 0]
+        wb_tgt = tgt_p[:, :, 0]
+        ex_hat = pred_p[:, :, 1]
+        ex_tgt = tgt_p[:, :, 1]
+        tau_hat = pred_p[:, :, 2]
+        tau_tgt = tgt_p[:, :, 2]
 
-        # excess delay
-        ex_err = pred_p[:,1:2] - tgt_p[:,1:2]
-        sum_ex_mae += (ex_err.abs() * m).sum().item()
-        sum_ex_mse += ((ex_err**2) * m).sum().item()
+        # masks
+        mp = m_path
+        me = m_ex
+        mt = m_tau
+        mn = (1.0 - mp)  # no-path
 
-        ex_mask = (tgt_p[:,1:2] >= ex_nmse_thresh_ns).to(tgt_p.dtype) * m
-        ex_nmse_num += ((ex_err**2) * ex_mask).sum().item()
-        ex_nmse_den += ((tgt_p[:,1:2]**2) * ex_mask).sum().clamp_min(1e-12).item()
+        # counts
+        sum_path += mp.sum().clamp_min(0.0).item()
+        sum_ex_tail += me.sum().clamp_min(0.0).item()
+        sum_tau_tail += mt.sum().clamp_min(0.0).item()
+        sum_nopath += mn.sum().clamp_min(0.0).item()
 
-        # tau_rms
-        tau_err = pred_p[:,2:3] - tgt_p[:,2:3]
-        sum_tau_mae += (tau_err.abs() * m).sum().item()
-        sum_tau_mse += ((tau_err**2) * m).sum().item()
+        # ---------------- WB on path ----------------
+        sum_wb_mae += ((wb_hat - wb_tgt).abs() * mp).sum().item()
 
-        tau_mask = (tgt_p[:,2:3] >= tau_nmse_thresh_ns).to(tgt_p.dtype) * m
-        tau_nmse_num += ((tau_err**2) * tau_mask).sum().item()
-        tau_nmse_den += ((tgt_p[:,2:3]**2) * tau_mask).sum().clamp_min(1e-12).item()
+        g_hat = torch.pow(10.0, -wb_hat / 10.0)
+        g_tgt = torch.pow(10.0, -wb_tgt / 10.0)
+        wb_nmse_num += (((g_hat - g_tgt) ** 2) * mp).sum().item()
+        wb_nmse_den += (((g_tgt) ** 2) * mp).sum().clamp_min(1e-12).item()
 
-    wb_mae = sum_wb_mae / max(sum_mask, 1e-12)
-    wb_nmse = wb_nmse_num / max(wb_nmse_den, 1e-12)
+        # ---------------- EX ----------------
+        ex_err = ex_hat - ex_tgt
+
+        # all-path
+        sum_ex_mae_path += (ex_err.abs() * mp).sum().item()
+        sum_ex_mse_path += ((ex_err ** 2) * mp).sum().item()
+
+        # tail (your m_ex)
+        sum_ex_mae_tail += (ex_err.abs() * me).sum().item()
+        sum_ex_mse_tail += ((ex_err ** 2) * me).sum().item()
+
+        # NMSE on tail (also use explicit threshold to be safe)
+        ex_mask = ((ex_tgt >= ex_nmse_thresh_ns).to(ex_tgt.dtype) * me)
+        ex_nmse_num += ((ex_err ** 2) * ex_mask).sum().item()
+        ex_nmse_den += ((ex_tgt ** 2) * ex_mask).sum().clamp_min(1e-12).item()
+
+        # leakage on no-path
+        sum_ex_abs_nopath += (ex_hat.abs() * mn).sum().item()
+
+        # ---------------- TAU ----------------
+        tau_err = tau_hat - tau_tgt
+
+        # all-path
+        sum_tau_mae_path += (tau_err.abs() * mp).sum().item()
+        sum_tau_mse_path += ((tau_err ** 2) * mp).sum().item()
+
+        # tail
+        sum_tau_mae_tail += (tau_err.abs() * mt).sum().item()
+        sum_tau_mse_tail += ((tau_err ** 2) * mt).sum().item()
+
+        tau_mask = ((tau_tgt >= tau_nmse_thresh_ns).to(tau_tgt.dtype) * mt)
+        tau_nmse_num += ((tau_err ** 2) * tau_mask).sum().item()
+        tau_nmse_den += ((tau_tgt ** 2) * tau_mask).sum().clamp_min(1e-12).item()
+
+        sum_tau_abs_nopath += (tau_hat.abs() * mn).sum().item()
+
+        n_batches += 1
+        if max_batches is not None and n_batches >= max_batches:
+            break
+
+    # finalize helpers
+    def safe_div(a, b): return a / max(b, 1e-12)
+
+    wb_mae = safe_div(sum_wb_mae, sum_path)
+    wb_nmse = safe_div(wb_nmse_num, wb_nmse_den)
     wb_nmse_db = 10.0 * math.log10(max(wb_nmse, 1e-12))
 
-    ex_mae = sum_ex_mae / max(sum_mask, 1e-12)
-    ex_rmse = math.sqrt(sum_ex_mse / max(sum_mask, 1e-12))
-    ex_nmse = ex_nmse_num / max(ex_nmse_den, 1e-12)
+    ex_mae_path = safe_div(sum_ex_mae_path, sum_path)
+    ex_rmse_path = math.sqrt(safe_div(sum_ex_mse_path, sum_path))
+
+    ex_mae_tail = safe_div(sum_ex_mae_tail, sum_ex_tail)
+    ex_rmse_tail = math.sqrt(safe_div(sum_ex_mse_tail, sum_ex_tail))
+    ex_nmse = safe_div(ex_nmse_num, ex_nmse_den)
     ex_nmse_db = 10.0 * math.log10(max(ex_nmse, 1e-12))
 
-    tau_mae = sum_tau_mae / max(sum_mask, 1e-12)
-    tau_rmse = math.sqrt(sum_tau_mse / max(sum_mask, 1e-12))
-    tau_nmse = tau_nmse_num / max(tau_nmse_den, 1e-12)
+    ex_leak = safe_div(sum_ex_abs_nopath, sum_nopath)
+
+    tau_mae_path = safe_div(sum_tau_mae_path, sum_path)
+    tau_rmse_path = math.sqrt(safe_div(sum_tau_mse_path, sum_path))
+
+    tau_mae_tail = safe_div(sum_tau_mae_tail, sum_tau_tail)
+    tau_rmse_tail = math.sqrt(safe_div(sum_tau_mse_tail, sum_tau_tail))
+    tau_nmse = safe_div(tau_nmse_num, tau_nmse_den)
     tau_nmse_db = 10.0 * math.log10(max(tau_nmse, 1e-12))
 
+    tau_leak = safe_div(sum_tau_abs_nopath, sum_nopath)
+
     print(
-        f"  [{tag}] wb_MAE={wb_mae:.3f} dB | wb_NMSE={wb_nmse:.4f} ({wb_nmse_db:.1f} dB) | "
-        f"ex_MAE={ex_mae:.3f} ns | ex_RMSE={ex_rmse:.3f} ns | ex_NMSE={ex_nmse:.4f} ({ex_nmse_db:.1f} dB) | "
-        f"tauRMS_MAE={tau_mae:.3f} ns | tauRMS_RMSE={tau_rmse:.3f} ns | tauRMS_NMSE={tau_nmse:.4f} ({tau_nmse_db:.1f} dB)"
+        f"  [{tag}] wb_MAE(path)={wb_mae:.3f} dB | wb_NMSE={wb_nmse:.4f} ({wb_nmse_db:.1f} dB)\n"
+        f"        ex_MAE(path)={ex_mae_path:.3f} ns | ex_RMSE(path)={ex_rmse_path:.3f} ns | "
+        f"ex_MAE(tail)={ex_mae_tail:.3f} ns | ex_RMSE(tail)={ex_rmse_tail:.3f} ns | "
+        f"ex_NMSE(tail)={ex_nmse:.4f} ({ex_nmse_db:.1f} dB) | ex_leak(no-path)={ex_leak:.3f} ns\n"
+        f"        tau_MAE(path)={tau_mae_path:.3f} ns | tau_RMSE(path)={tau_rmse_path:.3f} ns | "
+        f"tau_MAE(tail)={tau_mae_tail:.3f} ns | tau_RMSE(tail)={tau_rmse_tail:.3f} ns | "
+        f"tau_NMSE(tail)={tau_nmse:.4f} ({tau_nmse_db:.1f} dB) | tau_leak(no-path)={tau_leak:.3f} ns"
     )
 
 
@@ -545,14 +743,14 @@ def main():
 
     # infer shapes
     tmp = make_scene(rng)
-    x_tmp = build_feature_tensor(tmp, cfg.frequency_hz, requested=cfg.requested_features).astype(np.float32)
+    x_tmp = build_feature_tensor(tmp, cfg.frequency_hz, requested=cfg.dataset_features).astype(np.float32)
     c_in = int(x_tmp.shape[1])
     num_tx = int(tmp.antenna_database.tx_coords.shape[0])
     K, H, W = tmp.antenna_database.rx_grid.shape
 
     y_ch = 3
 
-    total_samples = cfg.num_scenes * num_tx * K
+    total_samples = cfg.num_scenes * num_tx
 
     x_path = out_dir / "x.dat"
     y_path = out_dir / "y.dat"
@@ -561,13 +759,16 @@ def main():
     state_path = out_dir / "model_state.pt"
     jit_path = out_dir / "model.pt"
 
+    feat_counts = infer_feature_channel_counts(tmp, cfg.frequency_hz, cfg.dataset_features)
+    keep_idx, c_full = build_keep_idx(cfg.dataset_features, cfg.model_features, K, feat_counts)
+
     print("x exists?", x_path.exists(), "y exists?", y_path.exists())
 
     # Build dataset if missing
     if not (x_path.exists() and y_path.exists() and meta_path.exists()):
         print("Building memmap dataset...")
-        x_mm = np.memmap(x_path, dtype="float32", mode="w+", shape=(total_samples, c_in, H, W))
-        y_mm = np.memmap(y_path, dtype="float16", mode="w+", shape=(total_samples, y_ch, H, W))
+        x_mm = np.memmap(x_path, dtype="float32", mode="w+", shape=(total_samples, c_in*K, H, W))
+        y_mm = np.memmap(y_path, dtype="float16", mode="w+", shape=(total_samples, y_ch*K, H, W))
 
         # write meta early so you can peek while generating
         meta = dict(
@@ -582,7 +783,8 @@ def main():
             smooth_gauss_sigma=float(cfg.smooth_gauss_sigma),
             frequency_hz=float(cfg.frequency_hz),
             x_dtype="float32", y_dtype="float16",
-            y_channels=["wb_loss_db", "excess_delay_ns_sm", "tau_rms_ns_sm"]
+            y_channels=["wb_loss_db", "excess_delay_ns_sm", "tau_rms_ns_sm"],
+            keep_idx = keep_idx.tolist(),
         )
         meta_path.write_text(json.dumps(meta, indent=2))
         print("Wrote meta (early):", meta_path)
@@ -591,22 +793,37 @@ def main():
         for s in range(cfg.num_scenes):
             scene = make_scene(rng)
 
-            x = build_feature_tensor(scene, cfg.frequency_hz, requested=cfg.requested_features).astype(np.float32)
+            x = build_feature_tensor(scene, cfg.frequency_hz, requested=cfg.dataset_features).astype(np.float32)
             y = compute_labels_for_scene(scene)
 
-            x_flat = x.transpose(0, 2, 1, 3, 4).reshape(num_tx * K, c_in, H, W)
-            y_flat = y.transpose(0, 2, 1, 3, 4).reshape(num_tx * K, y_ch, H, W)
+            # x: (num_tx, c_in, K, H, W)  -> (num_tx, K, c_in, H, W) -> (num_tx, K*c_in, H, W)
+            x_stack = x.transpose(0, 2, 1, 3, 4).reshape(num_tx, K * c_in, H, W)
 
-            n = x_flat.shape[0]
-            x_mm[idx:idx+n] = x_flat
-            y_mm[idx:idx+n] = y_flat.astype(np.float16)
+            # y: (num_tx, y_ch, K, H, W) -> (num_tx, K, y_ch, H, W) -> (num_tx, K*y_ch, H, W)
+            y_stack = y.transpose(0, 2, 1, 3, 4).reshape(num_tx, K * y_ch, H, W)
+
+            n = num_tx
+            x_mm[idx:idx+n] = x_stack
+            y_mm[idx:idx+n] = y_stack.astype(np.float16)
             idx += n
             x_mm.flush(); y_mm.flush()
             print(f"[scene {s+1:03d}/{cfg.num_scenes}] wrote {n} samples (total {idx})")
 
     # reopen memmaps
-    x_mm = np.memmap(x_path, dtype="float32", mode="r", shape=(total_samples, c_in, H, W))
-    y_mm = np.memmap(y_path, dtype="float16", mode="r", shape=(total_samples, y_ch, H, W))
+    meta = json.loads(meta_path.read_text())
+    total_samples = int(meta["total_samples"])
+    H = int(meta["H"]); W = int(meta["W"])
+    K = int(meta["K"]); c_in = int(meta["c_in"]); y_ch = int(meta["y_ch"])
+
+    # sanity:
+    assert c_full == c_in, (c_full, c_in)  # these should match
+    in_ch = int(keep_idx.size)
+
+    # keep_idx = None
+    # in_ch = c_in * K
+
+    x_mm = np.memmap(x_path, dtype="float32", mode="r", shape=(total_samples, c_in*K, H, W))
+    y_mm = np.memmap(y_path, dtype="float16", mode="r", shape=(total_samples, y_ch*K, H, W))
 
     # quick sanity stats
     samp = np.random.default_rng(cfg.seed + 1).choice(total_samples, size=min(256, total_samples), replace=False)
@@ -618,42 +835,100 @@ def main():
     print(f"tau_rms_sm(ns): mean={tr.mean():.2f} std={tr.std():.2f} min={tr.min():.2f} max={tr.max():.2f}")
 
     # norm stats
-    stats = compute_norm_stats(x_mm, y_mm, max_samples=512, seed=cfg.seed)
+    stats = compute_norm_stats(x_mm, y_mm, keep_idx=keep_idx, max_samples=512, seed=cfg.seed)
     np.savez(
         stats_path,
         x_mean=stats["x_mean"].numpy(), x_std=stats["x_std"].numpy(),
         y_mean=stats["y_mean"].numpy(), y_std=stats["y_std"].numpy(),
+        keep_idx=keep_idx,   
     )
     print("Saved stats:", stats_path)
 
     stats_dev = {k: v.to(cfg.device) for k, v in stats.items()}
+    y_mean = stats_dev["y_mean"]
+    y_std  = stats_dev["y_std"]
 
-    # split indices
-    perm = np.random.default_rng(cfg.seed).permutation(total_samples)
-    n_train = int(cfg.train_frac * total_samples)
-    train_idx = perm[:n_train]
-    val_idx = perm[n_train:]
+    # split train and validation by scene
+    rng = np.random.default_rng(cfg.seed)
 
-    train_ds = MemmapIndexDataset(x_mm, y_mm, train_idx, stats, cfg.no_path_wb_db)
-    val_ds   = MemmapIndexDataset(x_mm, y_mm, val_idx,   stats, cfg.no_path_wb_db)
+    samples_per_scene = num_tx   # for 2.5D
+    scene_ids = rng.permutation(cfg.num_scenes)
+
+    n_train_scenes = int(round(cfg.train_frac * cfg.num_scenes))
+    train_scenes = np.sort(scene_ids[:n_train_scenes])
+    val_scenes   = np.sort(scene_ids[n_train_scenes:])
+
+    def scene_to_indices(s):
+        base = s * samples_per_scene
+        return np.arange(base, base + samples_per_scene, dtype=np.int64)
+
+    train_idx = np.concatenate([scene_to_indices(s) for s in train_scenes])
+    val_idx   = np.concatenate([scene_to_indices(s) for s in val_scenes])
+
+    (out_dir/"split.json").write_text(json.dumps({
+    "train_scenes": train_scenes.tolist(),
+    "val_scenes": val_scenes.tolist(),
+    "samples_per_scene": int(samples_per_scene),
+    "seed": int(cfg.seed),
+    }, indent=2))
+
+    train_ds = MemmapIndexDataset(x_mm, y_mm, train_idx, stats, cfg.no_path_wb_db, K, y_ch, H, W, cfg.ex_loss_thresh_ns, cfg.tau_loss_thresh_ns, keep_idx=keep_idx)
+    val_ds   = MemmapIndexDataset(x_mm, y_mm, val_idx,   stats, cfg.no_path_wb_db, K, y_ch, H, W, cfg.ex_loss_thresh_ns, cfg.tau_loss_thresh_ns, keep_idx=keep_idx)
 
     train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, pin_memory=True)
     val_dl   = DataLoader(val_ds,   batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, pin_memory=True)
 
     # model
-    model = UNet3(in_ch=c_in, out_ch=y_ch, base=cfg.base, groups=cfg.groups, dropout=cfg.dropout).to(cfg.device)
+    model = UNet3(in_ch=in_ch, out_ch=y_ch*K, base=cfg.base, groups=cfg.groups, dropout=cfg.dropout).to(cfg.device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     scaler = torch.cuda.amp.GradScaler(enabled=(cfg.amp and cfg.device.startswith("cuda")))
 
-    def loss_fn(pred, tgt, mask):
-        m = mask.unsqueeze(1)
-        denom = m.sum().clamp_min(1.0)
+    def loss_fn(pred, tgt, m_path, m_ex, m_tau, y_mean, y_std):
+        """
+        pred, tgt: (B, K*Y, H, W) normalized
+        masks:     (B, K,   H, W) float {0,1}
+        y_mean/y_std: (K*Y,1,1) tensors on device
+        """
+        B, _, H, W = pred.shape
+        K = cfg.K_slices
+        Y = y_ch  # 3
 
-        l_wb  = F.smooth_l1_loss(pred[:,0:1]*m, tgt[:,0:1]*m, reduction="sum") / denom
-        l_ex  = F.smooth_l1_loss(pred[:,1:2]*m, tgt[:,1:2]*m, reduction="sum") / denom
-        l_tau = F.smooth_l1_loss(pred[:,2:3]*m, tgt[:,2:3]*m, reduction="sum") / denom
+        pred3 = pred.view(B, K, Y, H, W)
+        tgt3  = tgt.view(B, K, Y, H, W)
 
-        return 1.0*l_wb + 0.5*l_ex + 0.25*l_tau
+        mp = m_path.unsqueeze(2)  # (B,K,1,H,W)
+        me = m_ex.unsqueeze(2)
+        mt = m_tau.unsqueeze(2)
+
+        # ---- WB: compute NMSE in linear gain space using PHYSICAL wb (dB) ----
+        # reshape stats to (1,K,Y,1,1)
+        y_mean3 = y_mean.view(1, K, Y, 1, 1)
+        y_std3  = y_std.view(1, K, Y, 1, 1)
+
+        wb_hat = pred3[:, :, 0:1] * y_std3[:, :, 0:1] + y_mean3[:, :, 0:1]  # dB
+        wb_tgt = tgt3[:, :, 0:1]  * y_std3[:, :, 0:1] + y_mean3[:, :, 0:1]  # dB
+
+        g_hat = torch.pow(10.0, -wb_hat / 10.0)
+        g_tgt = torch.pow(10.0, -wb_tgt / 10.0)
+
+        num = ((g_hat - g_tgt) ** 2 * mp).sum()
+        den = ((g_tgt ** 2) * mp).sum().clamp_min(1e-12)
+        l_wb_gain_nmse = num / den
+
+        # (optional) also keep a small dB loss for stability
+        def masked_smooth_l1(a, b, m):
+            denom = m.sum().clamp_min(1.0)
+            return F.smooth_l1_loss(a*m, b*m, reduction="sum") / denom
+
+        l_wb_db  = masked_smooth_l1(pred3[:, :, 0:1], tgt3[:, :, 0:1], mp)
+
+        # ---- Delay heads (can stay normalized; masking was computed in physical space) ----
+        l_ex  = masked_smooth_l1(pred3[:, :, 1:2], tgt3[:, :, 1:2], me)
+        l_tau = masked_smooth_l1(pred3[:, :, 2:3], tgt3[:, :, 2:3], mt)
+
+        # combine
+        l_wb = 0.5 * l_wb_db + 0.5 * l_wb_gain_nmse   # tweak weights as you like
+        return 1.4*l_wb + 0.5*l_ex + 0.2*l_tau
 
 
     # training loop
@@ -663,15 +938,17 @@ def main():
         model.train()
         tr_loss = 0.0
 
-        for xb, yb, mb in train_dl:
+        for xb, yb, m_path, m_ex, m_tau in train_dl:
             xb = xb.to(cfg.device, non_blocking=True)
             yb = yb.to(cfg.device, non_blocking=True)
-            mb = mb.to(cfg.device, non_blocking=True)
+            m_path = m_path.to(cfg.device, non_blocking=True)
+            m_ex = m_ex.to(cfg.device, non_blocking=True)
+            m_tau = m_tau.to(cfg.device, non_blocking=True)
 
             opt.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=(cfg.amp and cfg.device.startswith("cuda"))):
                 pred = model(xb)
-                loss = loss_fn(pred, yb, mb, ep)
+                loss = loss_fn(pred, yb, m_path, m_ex, m_tau, y_mean, y_std)
 
             scaler.scale(loss).backward()
             if cfg.grad_clip and cfg.grad_clip > 0:
@@ -687,19 +964,21 @@ def main():
         model.eval()
         va_loss = 0.0
         with torch.no_grad():
-            for xb, yb, mb in val_dl:
+            for xb, yb, m_path, m_ex, m_tau in val_dl:
                 xb = xb.to(cfg.device, non_blocking=True)
                 yb = yb.to(cfg.device, non_blocking=True)
-                mb = mb.to(cfg.device, non_blocking=True)
+                m_path = m_path.to(cfg.device, non_blocking=True)
+                m_ex = m_ex.to(cfg.device, non_blocking=True)
+                m_tau = m_tau.to(cfg.device, non_blocking=True)
                 pred = model(xb)
-                va_loss += loss_fn(pred, yb, mb, ep).item()
+                va_loss += loss_fn(pred, yb, m_path, m_ex, m_tau, y_mean, y_std).item()
 
         va_loss /= max(len(val_dl), 1)
 
         dt = time.time() - t0
         print(f"ep {ep:03d}  train={tr_loss:.4f}  val={va_loss:.4f}  ({dt:.1f}s)")
 
-        report_metrics(model, val_dl, stats_dev, tag="val")
+        report_metrics(model, val_dl, stats_dev, y_ch, H, W, tag="val")
 
         if va_loss < best_val:
             best_val = va_loss
@@ -707,7 +986,7 @@ def main():
             print("  saved best state:", state_path)
 
             # TorchScript export (state dict + scripted)
-            example = torch.randn(1, c_in, H, W, device=cfg.device)
+            example = torch.randn(1, in_ch, H, W, device=cfg.device)
             try:
                 scripted = torch.jit.trace(model, example)
                 scripted.save(str(jit_path))
