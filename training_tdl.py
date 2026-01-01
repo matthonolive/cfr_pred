@@ -31,7 +31,7 @@ from mlink.channel_tdl import RtCfg, subcarrier_frequencies_centered, compute_td
 # ----------------------------
 @dataclass
 class CFG:
-    out_dir: str = "runs/3072_200k_merged"
+    out_dir: str = "runs/3072_200k_taupaths2"
 
     # scene / grids
     frequency_hz: float = 5.21e9
@@ -80,9 +80,9 @@ class CFG:
     smooth_gauss_sigma: float = 1.0
 
     # dataset size
-    num_scenes: int = 10
+    num_scenes: int = 30
     train_frac: float = 0.9
-    seed: int = 2003
+    seed: int = 1999
 
     # training
     batch_size: int = 8
@@ -95,10 +95,18 @@ class CFG:
     grad_clip: float = 1.0
 
     ex_loss_thresh_ns: float = 0.5     # or 1.0
-    tau_loss_thresh_ns: float = 25.0
+    tau_loss_thresh_ns: float = 0.0
 
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     amp: bool = True
+
+    tau_target: str = "raw"          # "raw" or "log10"
+    tau_log_eps_ns: float = 1e-3       # avoids log(0); 1e-3 ns is tiny
+    tau_cap_ns: float = 50.0           # soft prior: discourage > this
+    tau_phys_loss_w: float = 0.0      # add a small physical-space loss term
+    tau_cap_w: float = 0.0            # hinge penalty weight
+
+    tau_paths_rel_db: float = 30.0
 
 cfg = CFG()
 
@@ -306,23 +314,23 @@ def compute_labels_for_scene(scene: Scene) -> np.ndarray:
         for i0 in range(0, P, cfg.rx_batch):
             i1 = min(i0 + cfg.rx_batch, P)
 
-            wb_db, ex_s, taps = compute_tdl_batch(
+            wb_db, ex_s, taps, tau_rms_s = compute_tdl_batch(
                 si_scene=si,
                 tx_xyz=tx,
                 rx_xyz=rx_coords[i0:i1],
                 frequencies_hz=freqs,
-                L_taps=N,
+                L_taps=N,              # still fine to keep taps for other uses
                 rt=cfg.rt,
+                return_tau_rms=True,
             )
 
             wb_all[i0:i1] = wb_db
-            ex_all[i0:i1] = ex_s * 1e9  # ns
+            ex_all[i0:i1] = ex_s * 1e9
 
             good = wb_db < cfg.no_path_wb_db
             if np.any(good):
-                tau_rms_s = tau_rms_from_taps(taps[good], cfg.subcarrier_spacing_hz)
                 idx_g = np.nonzero(good)[0]
-                tau_all[i0 + idx_g] = tau_rms_s * 1e9  # ns
+                tau_all[i0 + idx_g] = tau_rms_s[good] * 1e9
 
         wb_map  = wb_all.reshape(K, H_img, W_img)
         ex_map  = ex_all.reshape(K, H_img, W_img)
@@ -364,6 +372,8 @@ def compute_norm_stats(
 
     x = np.array(x_mm[idx], dtype=np.float32)  # (S, Cx, H, W)
     y = np.array(y_mm[idx], dtype=np.float32)  # (S, Cy, H, W)
+
+    y = apply_y_transform_np(y, K=cfg.K_slices, y_ch=3)
 
     if keep_idx is not None:
         keep_idx = np.asarray(keep_idx, dtype=np.int64)
@@ -441,17 +451,26 @@ class MemmapIndexDataset(Dataset):
             x_np = x_np[self.keep_idx, :, :]  # (Cx_keep, H, W)
 
         x = torch.from_numpy(x_np)
-        y = torch.from_numpy(y_np)
-
-        # masks from PHYSICAL y (before normalization)
-        y3 = y.view(self.K, self.y_ch, self.H, self.W)  # (K, y_ch, H, W)
-        wb  = y3[:, 0]
-        ex  = y3[:, 1]
-        tau = y3[:, 2]
+        y_phys = y_np.astype(np.float32, copy=False)
+        y3_phys = torch.from_numpy(y_phys).view(self.K, self.y_ch, self.H, self.W)
+        wb  = y3_phys[:, 0]
+        ex  = y3_phys[:, 1]
+        tau = y3_phys[:, 2]
 
         mask_path = (wb < self.no_path_wb_db)
         mask_ex   = mask_path & (ex  >= self.ex_loss_thresh_ns)
+        # IMPORTANT: supervise tau everywhere on-path unless you really want tail-only
         mask_tau  = mask_path & (tau >= self.tau_loss_thresh_ns)
+
+        # --- now transform tau channel for training target ---
+        y_tf = y_phys.copy()
+        # y_tf is (K*y_ch,H,W); expand to (1, Cy, H, W) for reuse of helper
+        y_tf_ = y_tf[None, ...]
+        apply_y_transform_np(y_tf_, K=self.K, y_ch=self.y_ch)
+        y_tf = y_tf_[0]
+
+        x = torch.from_numpy(x_np)
+        y = torch.from_numpy(y_tf)
 
         # normalize
         x = (x - self.stats["x_mean"]) / self.stats["x_std"]
@@ -622,8 +641,18 @@ def report_metrics(model, dl, stats_dev, y_ch: int, H: int, W: int,
         wb_tgt = tgt_p[:, :, 0]
         ex_hat = pred_p[:, :, 1]
         ex_tgt = tgt_p[:, :, 1]
-        tau_hat = pred_p[:, :, 2]
-        tau_tgt = tgt_p[:, :, 2]
+        tau_hat_tgt = pred_p[:, :, 2]
+        tau_tgt_tgt = tgt_p[:, :, 2]
+
+        if cfg.tau_target == "log10":
+            tau_hat = torch.pow(10.0, tau_hat_tgt) - cfg.tau_log_eps_ns
+            tau_tgt = torch.pow(10.0, tau_tgt_tgt) - cfg.tau_log_eps_ns
+            tau_hat = torch.clamp(tau_hat, min=0.0)
+            tau_tgt = torch.clamp(tau_tgt, min=0.0)
+        else:
+            tau_hat = tau_hat_tgt
+            tau_tgt = tau_tgt_tgt
+
 
         # masks
         mp = m_path
@@ -723,6 +752,92 @@ def report_metrics(model, dl, stats_dev, y_ch: int, H: int, W: int,
     )
 
 
+### TAU RMS Helpers ###
+
+def tau_rms_from_paths(a: np.ndarray, tau_s: np.ndarray, rel_db: float = 30.0) -> np.ndarray:
+    """
+    a:     (B, P) complex path coefficients
+    tau_s: (B, P) path delays in seconds (absolute)
+    returns: (B,) tau_rms in seconds, computed on excess delays (tau - tau_min)
+    """
+    a = np.asarray(a)
+    tau_s = np.asarray(tau_s)
+
+    B = a.shape[0]
+    a = a.reshape(B, -1)
+    tau_s = tau_s.reshape(B, -1)
+
+    # power weights
+    p = (np.abs(a) ** 2).astype(np.float64)
+
+    # valid paths: finite delay, non-negative, positive power
+    valid = np.isfinite(tau_s) & (tau_s >= 0.0) & np.isfinite(p) & (p > 0.0)
+
+    out = np.zeros((B,), dtype=np.float64)
+
+    for b in range(B):
+        vb = valid[b]
+        if not np.any(vb):
+            continue
+
+        tb = tau_s[b, vb].astype(np.float64)
+        pb = p[b, vb].astype(np.float64)
+
+        # drop weak paths (relative to strongest remaining)
+        if rel_db is not None and rel_db > 0:
+            pmax = np.max(pb)
+            pb = np.where(pb >= pmax * (10.0 ** (-rel_db / 10.0)), pb, 0.0)
+
+        psum = np.sum(pb)
+        if psum <= 0:
+            continue
+
+        # IMPORTANT: excess delay axis
+        t0 = np.min(tb)
+        te = tb - t0
+
+        w = pb / psum
+        mu  = np.sum(w * te)
+        mu2 = np.sum(w * te * te)
+        var = max(mu2 - mu * mu, 0.0)
+        out[b] = np.sqrt(var)
+
+    return out.astype(np.float32)
+
+
+def tau_to_target(tau_ns: np.ndarray) -> np.ndarray:
+    """Physical tau(ns) -> training target for tau channel."""
+    tau_ns = np.maximum(tau_ns, 0.0).astype(np.float32)
+    if cfg.tau_target == "raw":
+        return tau_ns
+    elif cfg.tau_target == "log10":
+        return np.log10(tau_ns + cfg.tau_log_eps_ns).astype(np.float32)
+    else:
+        raise ValueError("cfg.tau_target must be 'raw' or 'log10'")
+
+def tau_from_target(tau_tgt: np.ndarray) -> np.ndarray:
+    """Training target -> physical tau(ns)."""
+    tau_tgt = tau_tgt.astype(np.float32)
+    if cfg.tau_target == "raw":
+        return np.maximum(tau_tgt, 0.0)
+    elif cfg.tau_target == "log10":
+        return np.maximum((10.0 ** tau_tgt) - cfg.tau_log_eps_ns, 0.0)
+    else:
+        raise ValueError("cfg.tau_target must be 'raw' or 'log10'")
+
+def apply_y_transform_np(y: np.ndarray, K: int, y_ch: int) -> np.ndarray:
+    """
+    Apply τ transform IN PLACE on numpy y.
+    y: (..., K*y_ch, H, W) float32
+    """
+    if cfg.tau_target == "raw":
+        return y
+    # tau channel is ch=2 in each slice
+    for k in range(K):
+        tau_idx = k * y_ch + 2
+        y[:, tau_idx, :, :] = tau_to_target(y[:, tau_idx, :, :])
+    return y
+
 def main():
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -785,6 +900,9 @@ def main():
             x_dtype="float32", y_dtype="float16",
             y_channels=["wb_loss_db", "excess_delay_ns_sm", "tau_rms_ns_sm"],
             keep_idx = keep_idx.tolist(),
+            tau_target=str(cfg.tau_target),
+            tau_log_eps_ns=float(cfg.tau_log_eps_ns),
+            tau_cap_ns=float(cfg.tau_cap_ns),
         )
         meta_path.write_text(json.dumps(meta, indent=2))
         print("Wrote meta (early):", meta_path)
@@ -833,6 +951,24 @@ def main():
     print(f"wb_loss(dB): mean={wb.mean():.2f} std={wb.std():.2f} min={wb.min():.2f} max={wb.max():.2f}")
     print(f"excess_delay_sm(ns): mean={ex.mean():.2f} std={ex.std():.2f} min={ex.min():.2f} max={ex.max():.2f}")
     print(f"tau_rms_sm(ns): mean={tr.mean():.2f} std={tr.std():.2f} min={tr.min():.2f} max={tr.max():.2f}")
+
+    samp = np.random.default_rng(cfg.seed + 2).choice(total_samples, size=min(128, total_samples), replace=False)
+    y_s = np.array(y_mm[samp], dtype=np.float32)  # (S, K*y_ch, H, W)
+
+    K = int(meta["K"]); y_ch = int(meta["y_ch"])
+    wb_s  = y_s[:, 0::y_ch, :, :]      # (S,K,H,W)
+    tau_s = y_s[:, 2::y_ch, :, :]      # (S,K,H,W)
+
+    m_path = (wb_s < cfg.no_path_wb_db)
+    tau_path = tau_s[m_path]
+    if tau_path.size > 0:
+        qs = np.percentile(tau_path, [1, 5, 10, 50, 90, 95, 99]).astype(np.float32)
+        print("tau_rms(ns) on PATH pixels quantiles [1,5,10,50,90,95,99]%:", qs)
+        print("tau_rms(ns) path min/max:", float(tau_path.min()), float(tau_path.max()))
+        print("tau_rms(ns) path frac <=10ns:", float(np.mean(tau_path <= 10.0)))
+        print("tau_rms(ns) path frac <=50ns:", float(np.mean(tau_path <= 50.0)))
+    else:
+        print("WARNING: no path pixels found in tau sanity sample")
 
     # norm stats
     stats = compute_norm_stats(x_mm, y_mm, keep_idx=keep_idx, max_samples=512, seed=cfg.seed)
@@ -924,11 +1060,37 @@ def main():
 
         # ---- Delay heads (can stay normalized; masking was computed in physical space) ----
         l_ex  = masked_smooth_l1(pred3[:, :, 1:2], tgt3[:, :, 1:2], me)
-        l_tau = masked_smooth_l1(pred3[:, :, 2:3], tgt3[:, :, 2:3], mt)
+        tau_mask = mp
+
+        # log/target-space loss (stable)
+        l_tau_tgt = masked_smooth_l1(pred3[:, :, 2:3], tgt3[:, :, 2:3], tau_mask)
+
+        # Optional: small physical-space loss + soft cap prior (only if using log target)
+        l_tau_phys = torch.tensor(0.0, device=pred.device)
+        l_tau_cap  = torch.tensor(0.0, device=pred.device)
+
+        if cfg.tau_target == "log10":
+            # unnormalize tau target to log10(ns)
+            tau_hat_log = pred3[:, :, 2:3] * y_std3[:, :, 2:3] + y_mean3[:, :, 2:3]
+            tau_tgt_log = tgt3[:, :, 2:3]  * y_std3[:, :, 2:3] + y_mean3[:, :, 2:3]
+
+            tau_hat_ns = torch.pow(10.0, tau_hat_log) - cfg.tau_log_eps_ns
+            tau_tgt_ns = torch.pow(10.0, tau_tgt_log) - cfg.tau_log_eps_ns
+            tau_hat_ns = torch.clamp(tau_hat_ns, min=0.0)
+            tau_tgt_ns = torch.clamp(tau_tgt_ns, min=0.0)
+
+            l_tau_phys = masked_smooth_l1(tau_hat_ns, tau_tgt_ns, tau_mask)
+
+            # hinge penalty discouraging huge tau
+            denom = tau_mask.sum().clamp_min(1.0)
+            l_tau_cap = ((F.relu(tau_hat_ns - cfg.tau_cap_ns) ** 2) * tau_mask).sum() / denom
+
+        #l_tau = l_tau_tgt + cfg.tau_phys_loss_w * l_tau_phys + cfg.tau_cap_w * l_tau_cap
+        l_tau = l_tau_tgt
 
         # combine
         l_wb = 0.5 * l_wb_db + 0.5 * l_wb_gain_nmse   # tweak weights as you like
-        return 1.4*l_wb + 0.5*l_ex + 0.2*l_tau
+        return 1.4*l_wb + 0.5*l_ex + 0.8*l_tau
 
 
     # training loop
