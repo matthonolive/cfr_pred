@@ -31,7 +31,7 @@ from mlink.channel_tdl import RtCfg, subcarrier_frequencies_centered, compute_td
 # ----------------------------
 @dataclass
 class CFG:
-    out_dir: str = "runs/3072_200k_taupaths2"
+    out_dir: str = "runs/tau_rms_3072_200k_merged"
 
     # scene / grids
     frequency_hz: float = 5.21e9
@@ -80,9 +80,9 @@ class CFG:
     smooth_gauss_sigma: float = 1.0
 
     # dataset size
-    num_scenes: int = 30
-    train_frac: float = 0.9
-    seed: int = 1999
+    num_scenes: int = 20
+    train_frac: float = 0.8
+    seed: int = 3077
 
     # training
     batch_size: int = 8
