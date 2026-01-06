@@ -32,7 +32,7 @@ C0 = 299_792_458.0
 # ----------------------------
 @dataclass
 class CFG:
-    out_dir: str = "runs/hard_cases2"
+    out_dir: str = "runs/hard_cases3"
 
     # scene / grids
     frequency_hz: float = 5.21e9
@@ -81,9 +81,9 @@ class CFG:
     smooth_gauss_sigma: float = 1.0
 
     # dataset size
-    num_scenes: int = 75
+    num_scenes: int = 100
     train_frac: float = 0.8
-    seed: int = 10000
+    seed: int = 4500
 
     # training
     batch_size: int = 8
@@ -111,7 +111,7 @@ class CFG:
 
     ###IMPROVING TRAINING FOR HARD CASES###
     hard_thr_db: float = 8.0        # start emphasizing when delta_pl > this
-    hard_gain: float = 5.0          # extra weight magnitude
+    hard_gain: float = 8.0          # extra weight magnitude
     hard_soft_db: float = 2.0       # smooth transition width
     delta_clip_lo: float = -30.0
     delta_clip_hi: float = 80.0
