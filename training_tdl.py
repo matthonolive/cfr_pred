@@ -25,13 +25,14 @@ from mlink.geometry import generate_wall_map, walls_to_mesh
 from mlink.scene import Scene
 from mlink.channel_tdl import RtCfg, subcarrier_frequencies_centered, compute_tdl_batch
 
+C0 = 299_792_458.0
 
 # ----------------------------
 # Config
 # ----------------------------
 @dataclass
 class CFG:
-    out_dir: str = "runs/tau_rms_3072_200k_merged"
+    out_dir: str = "runs/hard_cases2"
 
     # scene / grids
     frequency_hz: float = 5.21e9
@@ -59,7 +60,7 @@ class CFG:
     no_path_wb_db: float = 199.5  # compute_tdl_batch uses 200 dB sentinel
     rt: RtCfg = field(default_factory=lambda: RtCfg(
         max_depth=5,
-        samples_per_src=200_000,
+        samples_per_src=1_000_000,
         diffuse_reflection=True,
         diffraction=False,
     ))
@@ -80,9 +81,9 @@ class CFG:
     smooth_gauss_sigma: float = 1.0
 
     # dataset size
-    num_scenes: int = 20
+    num_scenes: int = 75
     train_frac: float = 0.8
-    seed: int = 3077
+    seed: int = 10000
 
     # training
     batch_size: int = 8
@@ -107,6 +108,14 @@ class CFG:
     tau_cap_w: float = 0.0            # hinge penalty weight
 
     tau_paths_rel_db: float = 30.0
+
+    ###IMPROVING TRAINING FOR HARD CASES###
+    hard_thr_db: float = 8.0        # start emphasizing when delta_pl > this
+    hard_gain: float = 5.0          # extra weight magnitude
+    hard_soft_db: float = 2.0       # smooth transition width
+    delta_clip_lo: float = -30.0
+    delta_clip_hi: float = 80.0
+
 
 cfg = CFG()
 
@@ -301,7 +310,7 @@ def compute_labels_for_scene(scene: Scene) -> np.ndarray:
     P = rx_coords.shape[0]
 
     N = int(cfg.fft_size)
-    y = np.zeros((tx_coords.shape[0], 3, K, H_img, W_img), dtype=np.float32)
+    y = np.zeros((tx_coords.shape[0], 4, K, H_img, W_img), dtype=np.float32)
 
     freqs = subcarrier_frequencies_centered(cfg.fft_size, cfg.subcarrier_spacing_hz)
     si = _to_sionna_geometry(scene, cfg.frequency_hz)
@@ -342,9 +351,23 @@ def compute_labels_for_scene(scene: Scene) -> np.ndarray:
         ex_sm  = np.maximum(ex_sm, 0.0)
         tau_sm = np.maximum(tau_sm, 0.0)
 
-        y[t, 0] = wb_map
+        d_m = np.linalg.norm(rx_coords - tx[None, :], axis=1).reshape(K, H_img, W_img).astype(np.float32)
+        fspl = fspl_db(d_m, cfg.frequency_hz)
+
+        valid = (wb_map < cfg.no_path_wb_db)
+        delta = (wb_map - fspl).astype(np.float32)
+        delta = np.clip(delta, cfg.delta_clip_lo, cfg.delta_clip_hi)
+
+        # no-path pixels: zero out regression targets to avoid nonsense
+        delta[~valid] = 0.0
+        ex_sm[~valid] = 0.0
+        tau_sm[~valid] = 0.0
+
+        y[t, 0] = delta
         y[t, 1] = ex_sm
         y[t, 2] = tau_sm
+        y[t, 3] = wb_map
+
 
         print(f"  tx {t+1}/{tx_coords.shape[0]} labels done")
 
@@ -373,7 +396,7 @@ def compute_norm_stats(
     x = np.array(x_mm[idx], dtype=np.float32)  # (S, Cx, H, W)
     y = np.array(y_mm[idx], dtype=np.float32)  # (S, Cy, H, W)
 
-    y = apply_y_transform_np(y, K=cfg.K_slices, y_ch=3)
+    y = apply_y_transform_np(y, K=cfg.K_slices, y_ch=y.shape[1] // cfg.K_slices)
 
     if keep_idx is not None:
         keep_idx = np.asarray(keep_idx, dtype=np.int64)
@@ -453,9 +476,11 @@ class MemmapIndexDataset(Dataset):
         x = torch.from_numpy(x_np)
         y_phys = y_np.astype(np.float32, copy=False)
         y3_phys = torch.from_numpy(y_phys).view(self.K, self.y_ch, self.H, self.W)
-        wb  = y3_phys[:, 0]
-        ex  = y3_phys[:, 1]
-        tau = y3_phys[:, 2]
+
+        delta = y3_phys[:, 0]
+        ex    = y3_phys[:, 1]
+        tau   = y3_phys[:, 2]
+        wb    = y3_phys[:, 3]
 
         mask_path = (wb < self.no_path_wb_db)
         mask_ex   = mask_path & (ex  >= self.ex_loss_thresh_ns)
@@ -588,6 +613,11 @@ def report_metrics(model, dl, stats_dev, y_ch: int, H: int, W: int,
     wb_nmse_num = 0.0
     wb_nmse_den = 0.0
 
+    # DELTA (on-path)
+    sum_delta_mae = 0.0
+    sum_delta_mae_hard = 0.0
+    sum_hard = 0.0
+
     # EX (all-path)
     sum_ex_mae_path = 0.0
     sum_ex_mse_path = 0.0
@@ -637,12 +667,20 @@ def report_metrics(model, dl, stats_dev, y_ch: int, H: int, W: int,
         pred_p = pred_p.view(B, K, y_ch, H, W)
         tgt_p  = tgt_p.view(B, K, y_ch, H, W)
 
-        wb_hat = pred_p[:, :, 0]
-        wb_tgt = tgt_p[:, :, 0]
+        # channels: 0=delta, 1=ex, 2=tau(target), 3=wb
+        delta_hat = pred_p[:, :, 0]
+        delta_tgt = tgt_p[:,  :, 0]
+
         ex_hat = pred_p[:, :, 1]
         ex_tgt = tgt_p[:, :, 1]
+
         tau_hat_tgt = pred_p[:, :, 2]
         tau_tgt_tgt = tgt_p[:, :, 2]
+
+        wb_tgt = tgt_p[:, :, 3]
+
+        # reconstruct wb_hat from delta (no need for FSPL in metrics)
+        wb_hat = wb_tgt + (delta_hat - delta_tgt)
 
         if cfg.tau_target == "log10":
             tau_hat = torch.pow(10.0, tau_hat_tgt) - cfg.tau_log_eps_ns
@@ -659,6 +697,12 @@ def report_metrics(model, dl, stats_dev, y_ch: int, H: int, W: int,
         me = m_ex
         mt = m_tau
         mn = (1.0 - mp)  # no-path
+
+        sum_delta_mae += ((delta_hat - delta_tgt).abs() * mp).sum().item()
+
+        hard = ((delta_tgt >= cfg.hard_thr_db).to(delta_tgt.dtype) * mp)
+        sum_delta_mae_hard += ((delta_hat - delta_tgt).abs() * hard).sum().item()
+        sum_hard += hard.sum().item()
 
         # counts
         sum_path += mp.sum().clamp_min(0.0).item()
@@ -721,6 +765,9 @@ def report_metrics(model, dl, stats_dev, y_ch: int, H: int, W: int,
     wb_nmse = safe_div(wb_nmse_num, wb_nmse_den)
     wb_nmse_db = 10.0 * math.log10(max(wb_nmse, 1e-12))
 
+    delta_mae = safe_div(sum_delta_mae, sum_path)
+    delta_mae_hard = safe_div(sum_delta_mae_hard, sum_hard)
+
     ex_mae_path = safe_div(sum_ex_mae_path, sum_path)
     ex_rmse_path = math.sqrt(safe_div(sum_ex_mse_path, sum_path))
 
@@ -742,7 +789,8 @@ def report_metrics(model, dl, stats_dev, y_ch: int, H: int, W: int,
     tau_leak = safe_div(sum_tau_abs_nopath, sum_nopath)
 
     print(
-        f"  [{tag}] wb_MAE(path)={wb_mae:.3f} dB | wb_NMSE={wb_nmse:.4f} ({wb_nmse_db:.1f} dB)\n"
+        f"  [{tag}] delta_MAE(path)={delta_mae:.3f} dB | delta_MAE(hard)={delta_mae_hard:.3f} dB | "
+        f"wb_MAE(path)={wb_mae:.3f} dB | wb_NMSE={wb_nmse:.4f} ({wb_nmse_db:.1f} dB)\n"
         f"        ex_MAE(path)={ex_mae_path:.3f} ns | ex_RMSE(path)={ex_rmse_path:.3f} ns | "
         f"ex_MAE(tail)={ex_mae_tail:.3f} ns | ex_RMSE(tail)={ex_rmse_tail:.3f} ns | "
         f"ex_NMSE(tail)={ex_nmse:.4f} ({ex_nmse_db:.1f} dB) | ex_leak(no-path)={ex_leak:.3f} ns\n"
@@ -838,6 +886,17 @@ def apply_y_transform_np(y: np.ndarray, K: int, y_ch: int) -> np.ndarray:
         y[:, tau_idx, :, :] = tau_to_target(y[:, tau_idx, :, :])
     return y
 
+### Frisky Business ###
+
+def fspl_db(d_m: np.ndarray, fc_hz: float) -> np.ndarray:
+    # FSPL = 20log10(4π d / λ)
+    d = np.maximum(d_m, 1e-3)  # avoid log(0)
+    lam = C0 / float(fc_hz)
+    return (20.0 * np.log10(4.0 * np.pi * d / lam) ).astype(np.float32)
+
+
+
+
 def main():
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -863,7 +922,7 @@ def main():
     num_tx = int(tmp.antenna_database.tx_coords.shape[0])
     K, H, W = tmp.antenna_database.rx_grid.shape
 
-    y_ch = 3
+    y_ch = 4
 
     total_samples = cfg.num_scenes * num_tx
 
@@ -898,7 +957,7 @@ def main():
             smooth_gauss_sigma=float(cfg.smooth_gauss_sigma),
             frequency_hz=float(cfg.frequency_hz),
             x_dtype="float32", y_dtype="float16",
-            y_channels=["wb_loss_db", "excess_delay_ns_sm", "tau_rms_ns_sm"],
+            y_channels=["delta_pl_db", "excess_delay_ns_sm", "tau_rms_ns_sm", "wb_loss_db"],
             keep_idx = keep_idx.tolist(),
             tau_target=str(cfg.tau_target),
             tau_log_eps_ns=float(cfg.tau_log_eps_ns),
@@ -1022,12 +1081,17 @@ def main():
     def loss_fn(pred, tgt, m_path, m_ex, m_tau, y_mean, y_std):
         """
         pred, tgt: (B, K*Y, H, W) normalized
-        masks:     (B, K,   H, W) float {0,1}
+        masks:     (B, K,   H, W) float {0,1} computed from physical wb (channel 3)
         y_mean/y_std: (K*Y,1,1) tensors on device
+        Assumes channels:
+        0: delta_pl_db
+        1: excess_delay_ns_sm
+        2: tau_rms (target space; may be log10)
+        3: wb_loss_db (for reconstruction/masks)
         """
         B, _, H, W = pred.shape
         K = cfg.K_slices
-        Y = y_ch  # 3
+        Y = y_ch  # should be 4 now
 
         pred3 = pred.view(B, K, Y, H, W)
         tgt3  = tgt.view(B, K, Y, H, W)
@@ -1036,43 +1100,60 @@ def main():
         me = m_ex.unsqueeze(2)
         mt = m_tau.unsqueeze(2)
 
-        # ---- WB: compute NMSE in linear gain space using PHYSICAL wb (dB) ----
         # reshape stats to (1,K,Y,1,1)
         y_mean3 = y_mean.view(1, K, Y, 1, 1)
         y_std3  = y_std.view(1, K, Y, 1, 1)
 
-        wb_hat = pred3[:, :, 0:1] * y_std3[:, :, 0:1] + y_mean3[:, :, 0:1]  # dB
-        wb_tgt = tgt3[:, :, 0:1]  * y_std3[:, :, 0:1] + y_mean3[:, :, 0:1]  # dB
-
-        g_hat = torch.pow(10.0, -wb_hat / 10.0)
-        g_tgt = torch.pow(10.0, -wb_tgt / 10.0)
-
-        num = ((g_hat - g_tgt) ** 2 * mp).sum()
-        den = ((g_tgt ** 2) * mp).sum().clamp_min(1e-12)
-        l_wb_gain_nmse = num / den
-
-        # (optional) also keep a small dB loss for stability
+        # ---------------- helpers ----------------
         def masked_smooth_l1(a, b, m):
             denom = m.sum().clamp_min(1.0)
             return F.smooth_l1_loss(a*m, b*m, reduction="sum") / denom
 
-        l_wb_db  = masked_smooth_l1(pred3[:, :, 0:1], tgt3[:, :, 0:1], mp)
+        # ---------------- DELTA (physical dB) ----------------
+        delta_hat = pred3[:, :, 0:1] * y_std3[:, :, 0:1] + y_mean3[:, :, 0:1]  # dB
+        delta_tgt = tgt3[:,  :, 0:1] * y_std3[:, :, 0:1] + y_mean3[:, :, 0:1]  # dB
 
-        # ---- Delay heads (can stay normalized; masking was computed in physical space) ----
-        l_ex  = masked_smooth_l1(pred3[:, :, 1:2], tgt3[:, :, 1:2], me)
+        # hard-pixel weights (only on-path)
+        # cfg.hard_thr_db / hard_gain / hard_soft_db should be added to CFG
+        w_hard = 1.0 + cfg.hard_gain * torch.sigmoid((delta_tgt - cfg.hard_thr_db) / cfg.hard_soft_db)
+        w = w_hard * mp  # (B,K,1,H,W)
+
+        denom = w.sum().clamp_min(1.0)
+        l_delta_db = (F.smooth_l1_loss(delta_hat, delta_tgt, reduction="none") * w).sum() / denom
+
+        # ---------------- WB gain NMSE via reconstruction ----------------
+        # wb target comes from channel 3
+        wb_tgt = tgt3[:, :, 3:4] * y_std3[:, :, 3:4] + y_mean3[:, :, 3:4]  # dB
+
+        # reconstruct wb_hat = wb_tgt + (delta_hat - delta_tgt)
+        # (equivalent to fspl + delta_hat without needing fspl inside loss_fn)
+        wb_hat = wb_tgt + (delta_hat - delta_tgt)
+
+        g_hat = torch.pow(10.0, -wb_hat / 10.0)
+        g_tgt = torch.pow(10.0, -wb_tgt / 10.0)
+
+        num = (((g_hat - g_tgt) ** 2) * mp).sum()
+        den = (((g_tgt) ** 2) * mp).sum().clamp_min(1e-12)
+        l_wb_gain_nmse = num / den
+
+        # Optional: small wb dB MAE (physical) for stability (kept small)
+        denom2 = mp.sum().clamp_min(1.0)
+        l_wb_db = (F.smooth_l1_loss(wb_hat, wb_tgt, reduction="none") * mp).sum() / denom2
+
+        # ---------------- Delay heads (normalized space is fine) ----------------
+        l_ex = masked_smooth_l1(pred3[:, :, 1:2], tgt3[:, :, 1:2], me)
+
+        # tau loss in target space (stable)
         tau_mask = mp
-
-        # log/target-space loss (stable)
         l_tau_tgt = masked_smooth_l1(pred3[:, :, 2:3], tgt3[:, :, 2:3], tau_mask)
 
-        # Optional: small physical-space loss + soft cap prior (only if using log target)
+        # Optional physical-space tau (only if using log10 target)
         l_tau_phys = torch.tensor(0.0, device=pred.device)
         l_tau_cap  = torch.tensor(0.0, device=pred.device)
 
         if cfg.tau_target == "log10":
-            # unnormalize tau target to log10(ns)
             tau_hat_log = pred3[:, :, 2:3] * y_std3[:, :, 2:3] + y_mean3[:, :, 2:3]
-            tau_tgt_log = tgt3[:, :, 2:3]  * y_std3[:, :, 2:3] + y_mean3[:, :, 2:3]
+            tau_tgt_log = tgt3[:,  :, 2:3] * y_std3[:, :, 2:3] + y_mean3[:, :, 2:3]
 
             tau_hat_ns = torch.pow(10.0, tau_hat_log) - cfg.tau_log_eps_ns
             tau_tgt_ns = torch.pow(10.0, tau_tgt_log) - cfg.tau_log_eps_ns
@@ -1081,17 +1162,22 @@ def main():
 
             l_tau_phys = masked_smooth_l1(tau_hat_ns, tau_tgt_ns, tau_mask)
 
-            # hinge penalty discouraging huge tau
-            denom = tau_mask.sum().clamp_min(1.0)
-            l_tau_cap = ((F.relu(tau_hat_ns - cfg.tau_cap_ns) ** 2) * tau_mask).sum() / denom
+            denom3 = tau_mask.sum().clamp_min(1.0)
+            l_tau_cap = ((F.relu(tau_hat_ns - cfg.tau_cap_ns) ** 2) * tau_mask).sum() / denom3
 
-        #l_tau = l_tau_tgt + cfg.tau_phys_loss_w * l_tau_phys + cfg.tau_cap_w * l_tau_cap
-        l_tau = l_tau_tgt
+        l_tau = l_tau_tgt  # + cfg.tau_phys_loss_w*l_tau_phys + cfg.tau_cap_w*l_tau_cap  (if you want)
 
-        # combine
-        l_wb = 0.5 * l_wb_db + 0.5 * l_wb_gain_nmse   # tweak weights as you like
-        return 1.4*l_wb + 0.5*l_ex + 0.8*l_tau
-
+        # ---------------- combine ----------------
+        # This is a good starting point; tweak if needed:
+        # - l_delta_db drives learning the obstruction residual (fixes "looks like Friis")
+        # - l_wb_gain_nmse ensures it matches received power in linear space
+        return (
+            1.0 * l_delta_db
+            + 0.5 * l_wb_gain_nmse
+            + 0.1 * l_wb_db
+            + 0.5 * l_ex
+            + 0.8 * l_tau
+        )
 
     # training loop
     best_val = float("inf")
