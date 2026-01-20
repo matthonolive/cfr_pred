@@ -32,7 +32,7 @@ C0 = 299_792_458.0
 # ----------------------------
 @dataclass
 class CFG:
-    out_dir: str = "runs/delta_3072_Jan7_merged"
+    out_dir: str = "runs/delta_3072_Jan20_diff"
 
     # scene / grids
     frequency_hz: float = 5.21e9
@@ -62,7 +62,9 @@ class CFG:
         max_depth=5,
         samples_per_src=1_000_000,
         diffuse_reflection=True,
-        diffraction=False,
+        diffraction=True,
+        edge_diffraction=True,
+        diffraction_lit_region=True
     ))
 
     # features
@@ -83,7 +85,7 @@ class CFG:
     # dataset size
     num_scenes: int = 100
     train_frac: float = 0.8
-    seed: int = 13384
+    seed: int = 20001999
 
     # training
     batch_size: int = 8
