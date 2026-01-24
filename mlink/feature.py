@@ -137,7 +137,8 @@ def ray_features(
     )
 
     total_wall_loss = total_wall_loss.reshape(-1, 1, *rx_grid.shape)
-    free_space_loss = 20 * np.log10(4 * np.pi * electrical_distance)
+    ed = np.maximum(electrical_distance, 1e-6) # avoid log10(0)
+    free_space_loss = 20 * np.log10(4 * np.pi * ed)
     total_path_loss = -free_space_loss + 10 * np.log10(total_wall_loss)
 
     num_obstructions = num_obstructions.reshape(-1, 1, *rx_grid.shape)
