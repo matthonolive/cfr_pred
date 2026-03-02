@@ -33,7 +33,7 @@ C0 = 299_792_458.0
 # ----------------------------
 @dataclass
 class CFG:
-    out_dir: str = "runs/delta_3072_10int"
+    out_dir: str = "runs/delta_3072_10int_variable"
 
     # scene / grids
     frequency_hz: float = 5.21e9
@@ -118,6 +118,20 @@ class CFG:
     hard_soft_db: float = 2.0       # smooth transition width
     delta_clip_lo: float = -30.0
     delta_clip_hi: float = 80.0
+
+    ###SUPER - Variable Size scenes
+    patch_hw: tuple[int,int] = (128, 128)   # training patch size (must be divisible by 8 ideally)
+    patches_per_tx: int = 8                # how many patches per TX per scene
+
+    # variable canvas (in pixels at 0.625m/px)
+    H_min: int = 64
+    H_max: int = 320
+    W_min: int = 64
+    W_max: int = 320
+
+    # free-space padding around the “actual” generated building (in pixels)
+    pad_min: int = 0
+    pad_max: int = 64
 
 
 cfg = CFG()
@@ -534,6 +548,27 @@ class ResBlock(nn.Module):
         h = self.conv2(h)
         return h + self.skip(x)
 
+
+class UNetPadWrapper(nn.Module):
+    def __init__(self, net: nn.Module, mult: int = 8):
+        super().__init__()
+        self.net = net
+        self.mult = mult
+
+    def forward(self, x):
+        # x: (B,C,H,W)
+        B, C, H, W = x.shape
+        pad_h = (self.mult - (H % self.mult)) % self.mult
+        pad_w = (self.mult - (W % self.mult)) % self.mult
+
+        if pad_h or pad_w:
+            # pad order: (left, right, top, bottom)
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode="constant", value=0.0)
+
+        y = self.net(x)
+
+        # crop back
+        return y[..., :H, :W]
 
 class UNet3(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, base: int = 32, groups: int = 8, dropout: float = 0.1):
@@ -1109,7 +1144,8 @@ def main():
     val_dl   = DataLoader(val_ds,   batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, pin_memory=True)
 
     # model
-    model = UNet3(in_ch=in_ch, out_ch=y_ch*K, base=cfg.base, groups=cfg.groups, dropout=cfg.dropout).to(cfg.device)
+    core = UNet3(in_ch=in_ch, out_ch=y_ch*K, base=cfg.base, groups=cfg.groups, dropout=cfg.dropout).to(cfg.device)
+    model = UNetPadWrapper(core, mult=8).to(cfg.device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     scaler = torch.cuda.amp.GradScaler(enabled=(cfg.amp and cfg.device.startswith("cuda")))
 
@@ -1324,11 +1360,10 @@ def main():
             # TorchScript export (state dict + scripted)
             example = torch.randn(1, in_ch, H, W, device=cfg.device)
             try:
-                scripted = torch.jit.trace(model, example)
+                scripted = torch.jit.script(model)
                 scripted.save(str(jit_path))
-                print("  saved TorchScript:", jit_path)
             except Exception as e:
-                print("  TorchScript export failed:", repr(e))
+                print("TorchScript export failed:", repr(e))
 
     print("Done.")
 
