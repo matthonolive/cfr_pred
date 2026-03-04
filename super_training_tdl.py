@@ -1,3 +1,4 @@
+
 import os
 os.environ.setdefault("MPLBACKEND", "Agg")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
@@ -25,6 +26,7 @@ from mlink.feature import build_feature_tensor
 from mlink.geometry import generate_wall_map, walls_to_mesh
 from mlink.scene import Scene
 from mlink.channel_tdl import RtCfg, subcarrier_frequencies_centered, compute_tdl_batch
+from mlink.cost import _compute_wall_losses, build_transmission_coeffs
 
 C0 = 299_792_458.0
 
@@ -120,7 +122,7 @@ class CFG:
     delta_clip_hi: float = 80.0
 
     ###SUPER - Variable Size scenes
-    patch_hw: tuple[int,int] = (128, 128)   # training patch size (must be divisible by 8 ideally)
+    patch_hw: tuple[int,int] = (64, 64)   # training patch size (must be divisible by 8 ideally)
     patches_per_tx: int = 8                # how many patches per TX per scene
 
     # variable canvas (in pixels at 0.625m/px)
@@ -262,22 +264,33 @@ def build_keep_idx(dataset_features, model_features, K, feat_counts):
     return np.asarray(keep, dtype=np.int64), c_full
 
 
-def make_scene(rng: np.random.Generator) -> Scene:
-    H, W = cfg.img_hw
+
+def make_scene(rng: np.random.Generator):
+    (Hc, Wc), (Hb, Wb), pads, bbox = sample_canvas_hw_and_bbox(rng)
     ceiling_h = float(rng.uniform(cfg.ceil_min, cfg.ceil_max))
 
+    # building walls (Hb,Wb)
+    walls_build = generate_wall_map(
+        (Hb, Wb),
+        min_wall_length=8,
+        min_door_length=4,
+        max_partitions=24,
+        rng=rng,
+    )
+
+    # embed into canvas
+    walls_canvas = np.zeros((Hc, Wc), dtype=walls_build.dtype)
+    i0, i1, j0, j1 = bbox
+    walls_canvas[i0:i1, j0:j1] = walls_build
+
+    # mesh from canvas walls
     mesh = walls_to_mesh(
-        generate_wall_map(
-            (H, W),
-            min_wall_length=8,
-            min_door_length=4,
-            max_partitions=24,
-            rng=rng,
-        ),
+        walls_canvas,
         floor_height=cfg.floor_h,
         ceiling_height=ceiling_h,
     ).apply_scale(cfg.scale)
 
+    # z slicing exactly as you had
     usable = max(ceiling_h - cfg.floor_h - 2 * cfg.z_margin, 1e-3)
     total_span = (cfg.K_slices - 1) * cfg.z_step
     z_step = usable / max(cfg.K_slices - 1, 1) if total_span > usable else cfg.z_step
@@ -289,19 +302,44 @@ def make_scene(rng: np.random.Generator) -> Scene:
     rx_grid = AntennaGrid(
         origin=cfg.scale * np.asarray([0.0, 0.0, z0], dtype=np.float32),
         deltas=cfg.scale * np.asarray([[1, 0, 0], [0, 1, 0], [0, 0, z_step]], dtype=np.float32),
-        shape=(cfg.K_slices, H, W),
+        shape=(cfg.K_slices, Hc, Wc),
     )
 
-    tx_grid = AntennaGrid(
-        origin=cfg.scale * np.asarray([cfg.tx_origin_xy[0], cfg.tx_origin_xy[1], cfg.tx_z], dtype=np.float32),
-        deltas=cfg.scale * np.asarray([[cfg.tx_spacing_xy, 0, 0], [0, cfg.tx_spacing_xy, 0], [0, 0, 1]], dtype=np.float32),
-        shape=cfg.tx_shape,
+    # build rx_coords from rx_grid
+    K, H_img, W_img = rx_grid.shape
+    k, i, j = np.meshgrid(np.arange(K), np.arange(H_img), np.arange(W_img), indexing="ij")
+    rx_coords = rx_grid.ijk2xyz(i, j, k).reshape(-1, 3).astype(np.float32)
+
+    # number of TX
+    n_tx = int(np.prod(cfg.tx_shape))  # 1*5*5=25
+
+    # tx_z is in "grid units" in your cfg; you were multiplying by scale before
+    tx_z_m = cfg.tx_z * cfg.scale
+
+    tx_coords = sample_tx_coords_free(
+        rng=rng,
+        walls_canvas=walls_canvas,
+        bbox=bbox,
+        n_tx=n_tx,
+        z_m=tx_z_m,
+        scale=cfg.scale,
+        margin_cells=1,
     )
 
-    antenna_db = AntennaDatabase.from_grid(tx_grid, rx_grid)
+    antenna_db = AntennaDatabase(tx_coords, rx_coords, None, rx_grid)
     mat_db = default_material_db(cfg.frequency_hz)
     face2material = {k: 0 for k in range(mesh.faces.shape[0])}
-    return Scene(mesh=mesh, material_database=mat_db, face2material=face2material, antenna_database=antenna_db)
+
+    scene = Scene(mesh=mesh, material_database=mat_db, face2material=face2material, antenna_database=antenna_db)
+
+    aux = {
+        "walls_canvas": walls_canvas,
+        "bbox": bbox,
+        "Hc": Hc, "Wc": Wc,
+        "Hb": Hb, "Wb": Wb,
+        "z0": z0,
+    }
+    return scene, aux
 
 
 def _to_sionna_geometry(scene: Scene, freq: float):
@@ -432,6 +470,244 @@ def compute_norm_stats(
         out["keep_idx"] = torch.from_numpy(keep_idx)
     return out
 
+def sample_canvas_hw_and_bbox(rng: np.random.Generator):
+    Hp, Wp = cfg.patch_hw
+
+    Hb = int(rng.integers(cfg.H_min, cfg.H_max + 1))
+    Wb = int(rng.integers(cfg.W_min, cfg.W_max + 1))
+
+    # optional: ensure canvas >= patch
+    Hb = max(Hb, Hp)
+    Wb = max(Wb, Wp)
+
+    pad_t = int(rng.integers(cfg.pad_min, cfg.pad_max + 1))
+    pad_b = int(rng.integers(cfg.pad_min, cfg.pad_max + 1))
+    pad_l = int(rng.integers(cfg.pad_min, cfg.pad_max + 1))
+    pad_r = int(rng.integers(cfg.pad_min, cfg.pad_max + 1))
+
+    Hc = Hb + pad_t + pad_b
+    Wc = Wb + pad_l + pad_r
+
+    # building bbox inside canvas (i axis = H, j axis = W)
+    i0, i1 = pad_t, pad_t + Hb
+    j0, j1 = pad_l, pad_l + Wb
+
+    return (Hc, Wc), (Hb, Wb), (pad_t, pad_b, pad_l, pad_r), (i0, i1, j0, j1)
+
+def sample_tx_coords_free(
+    rng: np.random.Generator,
+    walls_canvas: np.ndarray,     # (Hc,Wc) {0,1}
+    bbox: tuple[int,int,int,int], # (i0,i1,j0,j1) building region
+    n_tx: int,
+    z_m: float,
+    scale: float,
+    margin_cells: int = 1,
+    max_tries: int = 50_000,
+) -> np.ndarray:
+    i0, i1, j0, j1 = bbox
+    Hc, Wc = walls_canvas.shape
+
+    # candidate region: inside building bbox, shrink by margin
+    ii0 = i0 + margin_cells
+    ii1 = i1 - margin_cells
+    jj0 = j0 + margin_cells
+    jj1 = j1 - margin_cells
+    if ii1 <= ii0 or jj1 <= jj0:
+        raise ValueError("Building bbox too small after margins for TX placement.")
+
+    # free mask within bbox
+    sub = walls_canvas[ii0:ii1, jj0:jj1]
+    free = np.argwhere(sub == 0)  # (N,2) in sub-coordinates
+
+    if free.shape[0] == 0:
+        raise ValueError("No free cells in building bbox for TX placement.")
+
+    # sample without replacement if possible
+    if free.shape[0] >= n_tx:
+        pick = rng.choice(free.shape[0], size=n_tx, replace=False)
+    else:
+        pick = rng.choice(free.shape[0], size=n_tx, replace=True)
+
+    ij = free[pick]
+    i = ij[:, 0] + ii0
+    j = ij[:, 1] + jj0
+
+    # convert to meters at cell centers
+    x = (i.astype(np.float32) + 0.5) * scale
+    y = (j.astype(np.float32) + 0.5) * scale
+    z = np.full_like(x, z_m, dtype=np.float32)
+
+    tx = np.stack([x, y, z], axis=1).astype(np.float32)
+
+    # final assert safety
+    assert np.all(walls_canvas[i, j] == 0), "TX landed in wall — bug in sampling."
+    return tx
+
+def sample_patch_topleft(rng, Hc, Wc, bbox, patch_hw):
+    Hp, Wp = patch_hw
+    i0, i1, j0, j1 = bbox
+
+    # pick a random center in the building bbox
+    ci = int(rng.integers(i0, i1))
+    cj = int(rng.integers(j0, j1))
+
+    top  = int(np.clip(ci - Hp // 2, 0, Hc - Hp))
+    left = int(np.clip(cj - Wp // 2, 0, Wc - Wp))
+    return top, left
+
+def patch_keep_mask(bbox, top, left, patch_hw):
+    Hp, Wp = patch_hw
+    i0, i1, j0, j1 = bbox
+
+    gi = top + np.arange(Hp)[:, None]  # (Hp,1)
+    gj = left + np.arange(Wp)[None, :] # (1,Wp)
+
+    inside = (gi >= i0) & (gi < i1) & (gj >= j0) & (gj < j1)  # (Hp,Wp)
+    return inside
+
+def build_x_patch(
+    si_geom,             # scene.to_sionna_geometry(freq) result
+    mesh,                # scene.mesh (for bounds)
+    walls_canvas: np.ndarray,
+    bbox,
+    tx_xyz: np.ndarray,  # (3,)
+    rx_grid_patch: AntennaGrid,
+    rx_coords_patch: np.ndarray,  # (P,3)
+    top: int,
+    left: int,
+) -> np.ndarray:
+    K, Hp, Wp = rx_grid_patch.shape
+
+    keep2 = patch_keep_mask(bbox, top, left, (Hp, Wp))  # (Hp,Wp)
+    keep3 = np.broadcast_to(keep2[None, :, :], (K, Hp, Wp))
+
+    # 1) binary_walls from stored canvas
+    wall2 = walls_canvas[top:top+Hp, left:left+Wp].astype(np.float32)  # (Hp,Wp) 0/1
+    walls = np.broadcast_to(wall2[None, None, None, :, :], (1, 1, K, Hp, Wp)).copy()
+
+    # 2) electrical_distance (distance * f / c)
+    d = np.linalg.norm(rx_coords_patch - tx_xyz[None, :], axis=1).astype(np.float32)  # (P,)
+    e = (d * (cfg.frequency_hz / C0)).reshape(K, Hp, Wp)
+    e = e[None, None, :, :, :]  # (1,1,K,Hp,Wp)
+
+    # 3) COST "cost" feature (same as feature.py ray_features[:,0])
+    mi_scene = si_geom.mi_scene
+    per_wall = build_transmission_coeffs(mi_scene, cfg.frequency_hz)
+    total_wall_loss, _ = _compute_wall_losses(mi_scene, tx_xyz[None, :], rx_coords_patch, per_wall)  # (P,)
+    total_wall_loss = np.maximum(total_wall_loss.astype(np.float32), 1e-12).reshape(K, Hp, Wp)
+
+    # FSPL term matches feature.py: 20log10(4π * electrical_distance)
+    e_safe = np.maximum(e[0, 0], 1e-6)
+    fs_loss = (20.0 * np.log10(4.0 * np.pi * e_safe)).astype(np.float32)
+
+    cost = (-fs_loss + 10.0 * np.log10(total_wall_loss)).astype(np.float32)  # (K,Hp,Wp)
+    cost = cost[None, None, :, :, :]  # (1,1,K,Hp,Wp)
+
+    # 4) height_cond (same as feature.py)
+    z_min = float(mesh.bounds[0, 2])
+    z_max = float(mesh.bounds[1, 2])
+    room_h = max(z_max - z_min, 1e-6)
+
+    k = np.arange(K, dtype=np.float32)
+    z_slices = (rx_grid_patch.origin[None, :] + k[:, None] * rx_grid_patch.deltas[2][None, :])[:, 2]
+    z_rel = (z_slices - z_min) / room_h
+    d_floor = (z_slices - z_min)
+    d_ceil  = (z_max - z_slices)
+    cond = np.stack([z_rel, d_floor, d_ceil], axis=0)  # (3,K)
+    cond = cond[None, :, :, None, None]
+    cond = np.broadcast_to(cond, (1, 3, K, Hp, Wp)).astype(np.float32)
+
+    # concat in cfg.dataset_features order
+    feats = {
+        "binary_walls": walls,
+        "electrical_distance": e,
+        "cost": cost,
+        "height_cond": cond,
+    }
+    x = np.concatenate([feats[f] for f in cfg.dataset_features], axis=1)  # (1,C,K,Hp,Wp)
+
+    # ignore padded region: zero features outside building bbox
+    keep = keep3[None, None, :, :, :].astype(np.float32)  # (1,1,K,Hp,Wp)
+    x *= keep
+    return x
+
+def compute_labels_for_patch(
+    si_geom,
+    tx_xyz: np.ndarray,
+    rx_coords_patch: np.ndarray,
+    rx_grid_patch: AntennaGrid,
+    bbox,
+    top: int,
+    left: int,
+) -> np.ndarray:
+    K, Hp, Wp = rx_grid_patch.shape
+    P = rx_coords_patch.shape[0]
+
+    y = np.zeros((4, K, Hp, Wp), dtype=np.float32)
+
+    freqs = subcarrier_frequencies_centered(cfg.fft_size, cfg.subcarrier_spacing_hz)
+
+    wb_all  = np.zeros((P,), dtype=np.float32)
+    ex_all  = np.zeros((P,), dtype=np.float32)
+    tau_all = np.zeros((P,), dtype=np.float32)
+
+    for i0 in range(0, P, cfg.rx_batch):
+        i1 = min(i0 + cfg.rx_batch, P)
+
+        # keep your local compute_tdl_batch signature (you already use return_tau_rms=True)
+        wb_db, ex_s, taps, tau_rms_s = compute_tdl_batch(
+            si_scene=si_geom,
+            tx_xyz=tx_xyz,
+            rx_xyz=rx_coords_patch[i0:i1],
+            frequencies_hz=freqs,
+            L_taps=int(cfg.fft_size),
+            rt=cfg.rt,
+            return_tau_rms=True,
+        )
+
+        wb_all[i0:i1] = wb_db
+        ex_all[i0:i1] = ex_s * 1e9
+
+        good = wb_db < cfg.no_path_wb_db
+        if np.any(good):
+            idx_g = np.nonzero(good)[0]
+            tau_all[i0 + idx_g] = tau_rms_s[good] * 1e9
+
+    wb_map  = wb_all.reshape(K, Hp, Wp)
+    ex_map  = ex_all.reshape(K, Hp, Wp)
+    tau_map = tau_all.reshape(K, Hp, Wp)
+
+    # smooth using your existing smooth_map_stack
+    ex_sm  = smooth_map_stack(ex_map, wb_map)
+    tau_sm = smooth_map_stack(tau_map, wb_map)
+
+    ex_sm  = np.maximum(ex_sm, 0.0)
+    tau_sm = np.maximum(tau_sm, 0.0)
+
+    d_m = np.linalg.norm(rx_coords_patch - tx_xyz[None, :], axis=1).reshape(K, Hp, Wp).astype(np.float32)
+    fspl = fspl_db(d_m, cfg.frequency_hz)
+
+    valid = (wb_map < cfg.no_path_wb_db)
+    delta = np.clip((wb_map - fspl).astype(np.float32), cfg.delta_clip_lo, cfg.delta_clip_hi)
+
+    # zero out no-path
+    delta[~valid] = 0.0
+    ex_sm[~valid] = 0.0
+    tau_sm[~valid] = 0.0
+
+    # IGNORE PADDED REGION: force wb to no-path outside building bbox
+    keep2 = patch_keep_mask(bbox, top, left, (Hp, Wp))
+    keep3 = np.broadcast_to(keep2[None, :, :], (K, Hp, Wp))
+    wb_map[~keep3]  = cfg.no_path_wb_db
+    delta[~keep3]   = 0.0
+    ex_sm[~keep3]   = 0.0
+    tau_sm[~keep3]  = 0.0
+
+    y[0] = delta
+    y[1] = ex_sm
+    y[2] = tau_sm
+    y[3] = wb_map
+    return y  # (4,K,Hp,Wp)
 
 class MemmapIndexDataset(Dataset):
     def __init__(
@@ -968,6 +1244,11 @@ def fspl_db(d_m: np.ndarray, fc_hz: float) -> np.ndarray:
 
 
 def main():
+
+    assert cfg.H_min >= cfg.patch_hw[0] and cfg.W_min >= cfg.patch_hw[1], "Set H_min/W_min >= patch_hw (or auto-pad in make_scene)."
+
+    
+
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -985,16 +1266,23 @@ def main():
 
     rng = np.random.default_rng(cfg.seed)
 
-    # infer shapes
-    tmp = make_scene(rng)
-    x_tmp = build_feature_tensor(tmp, cfg.frequency_hz, requested=cfg.dataset_features).astype(np.float32)
-    c_in = int(x_tmp.shape[1])
-    num_tx = int(tmp.antenna_database.tx_coords.shape[0])
-    K, H, W = tmp.antenna_database.rx_grid.shape
+    # ---------- patch/variable-scene shapes ----------
+    feat_counts = {"binary_walls": 1, "electrical_distance": 1, "cost": 1, "height_cond": 3}
+    c_in = sum(feat_counts[f] for f in cfg.dataset_features)
 
+    K = cfg.K_slices
+    Hp, Wp = cfg.patch_hw
     y_ch = 4
 
-    total_samples = cfg.num_scenes * num_tx
+    n_tx = int(np.prod(cfg.tx_shape))  # 1*5*5 = 25
+    samples_per_scene = n_tx * cfg.patches_per_tx
+    total_samples = cfg.num_scenes * samples_per_scene
+
+    keep_idx, c_full = build_keep_idx(cfg.dataset_features, cfg.model_features, K, feat_counts)
+    in_ch = int(keep_idx.size)
+
+    # sanity
+    assert c_full == c_in, (c_full, c_in)
 
     x_path = out_dir / "x.dat"
     y_path = out_dir / "y.dat"
@@ -1003,32 +1291,38 @@ def main():
     state_path = out_dir / "model_state.pt"
     jit_path = out_dir / "model.pt"
 
-    feat_counts = infer_feature_channel_counts(tmp, cfg.frequency_hz, cfg.dataset_features)
-    keep_idx, c_full = build_keep_idx(cfg.dataset_features, cfg.model_features, K, feat_counts)
-
     print("x exists?", x_path.exists(), "y exists?", y_path.exists())
 
     # Build dataset if missing
     if not (x_path.exists() and y_path.exists() and meta_path.exists()):
         print("Building memmap dataset...")
-        x_mm = np.memmap(x_path, dtype="float32", mode="w+", shape=(total_samples, c_in*K, H, W))
-        y_mm = np.memmap(y_path, dtype="float16", mode="w+", shape=(total_samples, y_ch*K, H, W))
+        x_mm = np.memmap(x_path, dtype="float32", mode="w+", shape=(total_samples, c_in*K, Hp, Wp))
+        y_mm = np.memmap(y_path, dtype="float16", mode="w+", shape=(total_samples, y_ch*K, Hp, Wp))
 
         # write meta early so you can peek while generating
         meta = dict(
             total_samples=int(total_samples),
-            H=int(H), W=int(W), K=int(K), num_tx=int(num_tx),
+            Hp=int(Hp), Wp=int(Wp),
+            K=int(K),
+            num_tx=int(n_tx),
+            patches_per_tx=int(cfg.patches_per_tx),
+            samples_per_scene=int(samples_per_scene),
             c_in=int(c_in),
             y_ch=int(y_ch),
+
+            patch_hw=[int(Hp), int(Wp)],
+            # (optional but helpful)
+            variable_canvas=dict(H_min=cfg.H_min, H_max=cfg.H_max, W_min=cfg.W_min, W_max=cfg.W_max,
+                                pad_min=cfg.pad_min, pad_max=cfg.pad_max),
+            frequency_hz=float(cfg.frequency_hz),
             fft_size=int(cfg.fft_size),
             subcarrier_spacing_hz=float(cfg.subcarrier_spacing_hz),
             smooth_kind=str(cfg.smooth_kind),
             smooth_median_size=int(cfg.smooth_median_size),
             smooth_gauss_sigma=float(cfg.smooth_gauss_sigma),
-            frequency_hz=float(cfg.frequency_hz),
             x_dtype="float32", y_dtype="float16",
             y_channels=["delta_pl_db", "excess_delay_ns_sm", "tau_rms_ns_sm", "wb_loss_db"],
-            keep_idx = keep_idx.tolist(),
+            keep_idx=keep_idx.tolist(),
             tau_target=str(cfg.tau_target),
             tau_log_eps_ns=float(cfg.tau_log_eps_ns),
             tau_cap_ns=float(cfg.tau_cap_ns),
@@ -1037,30 +1331,63 @@ def main():
         print("Wrote meta (early):", meta_path)
 
         idx = 0
+        Hp, Wp = cfg.patch_hw
+
         for s in range(cfg.num_scenes):
-            scene = make_scene(rng)
+            scene, aux = make_scene(rng)
+            walls_canvas = aux["walls_canvas"]
+            bbox = aux["bbox"]
 
-            x = build_feature_tensor(scene, cfg.frequency_hz, requested=cfg.dataset_features).astype(np.float32)
-            y = compute_labels_for_scene(scene)
+            si_geom = _to_sionna_geometry(scene, cfg.frequency_hz)
 
-            # x: (num_tx, c_in, K, H, W)  -> (num_tx, K, c_in, H, W) -> (num_tx, K*c_in, H, W)
-            x_stack = x.transpose(0, 2, 1, 3, 4).reshape(num_tx, K * c_in, H, W)
+            tx_coords = scene.antenna_database.tx_coords  # (n_tx,3)
+            rx_grid_full = scene.antenna_database.rx_grid
+            assert rx_grid_full is not None
 
-            # y: (num_tx, y_ch, K, H, W) -> (num_tx, K, y_ch, H, W) -> (num_tx, K*y_ch, H, W)
-            y_stack = y.transpose(0, 2, 1, 3, 4).reshape(num_tx, K * y_ch, H, W)
+            for t, tx in enumerate(tx_coords):
+                for p in range(cfg.patches_per_tx):
+                    top, left = sample_patch_topleft(rng, aux["Hc"], aux["Wc"], bbox, (Hp, Wp))
 
-            n = num_tx
-            x_mm[idx:idx+n] = x_stack
-            y_mm[idx:idx+n] = y_stack.astype(np.float16)
-            idx += n
+                    # patch rx_grid
+                    origin_patch = (rx_grid_full.origin
+                                    + top  * rx_grid_full.deltas[0]
+                                    + left * rx_grid_full.deltas[1])
+                    rx_grid_patch = AntennaGrid(origin=origin_patch, deltas=rx_grid_full.deltas, shape=(cfg.K_slices, Hp, Wp))
+
+                    # patch rx_coords
+                    K = cfg.K_slices
+                    k, i, j = np.meshgrid(np.arange(K), np.arange(Hp), np.arange(Wp), indexing="ij")
+                    rx_coords_patch = rx_grid_patch.ijk2xyz(i, j, k).reshape(-1, 3).astype(np.float32)
+
+                    # build x and y for this (tx,patch)
+                    x1 = build_x_patch(si_geom, scene.mesh, walls_canvas, bbox, tx, rx_grid_patch, rx_coords_patch, top, left)  # (1,C,K,Hp,Wp)
+                    y1 = compute_labels_for_patch(si_geom, tx, rx_coords_patch, rx_grid_patch, bbox, top, left)                # (4,K,Hp,Wp)
+
+                    # stack to memmap sample format
+                    # x: (1,C,K,Hp,Wp) -> (1,K,C,Hp,Wp) -> (1,K*C,Hp,Wp)
+                    C = x1.shape[1]
+                    x_stack = x1.transpose(0, 2, 1, 3, 4).reshape(1, K*C, Hp, Wp).astype(np.float32)
+
+                    # y: (4,K,Hp,Wp) -> (K,4,Hp,Wp) -> (K*4,Hp,Wp)
+                    y_stack = y1.transpose(1, 0, 2, 3).reshape(K*4, Hp, Wp).astype(np.float16)
+
+                    x_mm[idx] = x_stack[0]
+                    y_mm[idx] = y_stack
+                    idx += 1
+
             x_mm.flush(); y_mm.flush()
-            print(f"[scene {s+1:03d}/{cfg.num_scenes}] wrote {n} samples (total {idx})")
+            print(f"[scene {s+1:03d}/{cfg.num_scenes}] wrote {samples_per_scene} patches (total {idx}/{total_samples})")
+
+        assert idx == total_samples, f"Dataset write incomplete: idx={idx} total={total_samples}"
 
     # reopen memmaps
     meta = json.loads(meta_path.read_text())
     total_samples = int(meta["total_samples"])
-    H = int(meta["H"]); W = int(meta["W"])
+    Hp = int(meta["Hp"]); Wp = int(meta["Wp"])
     K = int(meta["K"]); c_in = int(meta["c_in"]); y_ch = int(meta["y_ch"])
+
+    n_tx = int(meta["num_tx"])
+    samples_per_scene = int(meta["samples_per_scene"])
 
     # sanity:
     assert c_full == c_in, (c_full, c_in)  # these should match
@@ -1069,23 +1396,28 @@ def main():
     # keep_idx = None
     # in_ch = c_in * K
 
-    x_mm = np.memmap(x_path, dtype="float32", mode="r", shape=(total_samples, c_in*K, H, W))
-    y_mm = np.memmap(y_path, dtype="float16", mode="r", shape=(total_samples, y_ch*K, H, W))
+    x_mm = np.memmap(x_path, dtype="float32", mode="r", shape=(total_samples, c_in*K, Hp, Wp))
+    y_mm = np.memmap(y_path, dtype="float16", mode="r", shape=(total_samples, y_ch*K, Hp, Wp))
 
     # quick sanity stats
     samp = np.random.default_rng(cfg.seed + 1).choice(total_samples, size=min(256, total_samples), replace=False)
-    wb = np.array(y_mm[samp, 0], dtype=np.float32)
-    ex = np.array(y_mm[samp, 1], dtype=np.float32)
-    tr = np.array(y_mm[samp, 2], dtype=np.float32)
-    print(f"wb_loss(dB): mean={wb.mean():.2f} std={wb.std():.2f} min={wb.min():.2f} max={wb.max():.2f}")
-    print(f"excess_delay_sm(ns): mean={ex.mean():.2f} std={ex.std():.2f} min={ex.min():.2f} max={ex.max():.2f}")
-    print(f"tau_rms_sm(ns): mean={tr.mean():.2f} std={tr.std():.2f} min={tr.min():.2f} max={tr.max():.2f}")
+    y_s = np.array(y_mm[samp], dtype=np.float32)  # (S, K*y_ch, Hp, Wp)
+
+    delta_s = y_s[:, 0::y_ch, :, :]
+    ex_s    = y_s[:, 1::y_ch, :, :]
+    tau_s   = y_s[:, 2::y_ch, :, :]
+    wb_s    = y_s[:, 3::y_ch, :, :]
+
+    print(f"delta(dB): mean={delta_s.mean():.2f} std={delta_s.std():.2f} min={delta_s.min():.2f} max={delta_s.max():.2f}")
+    print(f"ex(ns):    mean={ex_s.mean():.2f} std={ex_s.std():.2f} min={ex_s.min():.2f} max={ex_s.max():.2f}")
+    print(f"tau(ns):   mean={tau_s.mean():.2f} std={tau_s.std():.2f} min={tau_s.min():.2f} max={tau_s.max():.2f}")
+    print(f"wb(dB):    mean={wb_s.mean():.2f} std={wb_s.std():.2f} min={wb_s.min():.2f} max={wb_s.max():.2f}")
 
     samp = np.random.default_rng(cfg.seed + 2).choice(total_samples, size=min(128, total_samples), replace=False)
     y_s = np.array(y_mm[samp], dtype=np.float32)  # (S, K*y_ch, H, W)
 
     K = int(meta["K"]); y_ch = int(meta["y_ch"])
-    wb_s  = y_s[:, 0::y_ch, :, :]      # (S,K,H,W)
+    wb_s  = y_s[:, 3::y_ch, :, :]      # (S,K,H,W)
     tau_s = y_s[:, 2::y_ch, :, :]      # (S,K,H,W)
 
     m_path = (wb_s < cfg.no_path_wb_db)
@@ -1116,10 +1448,12 @@ def main():
     # split train and validation by scene
     rng = np.random.default_rng(cfg.seed)
 
-    samples_per_scene = num_tx   # for 2.5D
-    scene_ids = rng.permutation(cfg.num_scenes)
+    #samples_per_scene = n_tx * cfg.patches_per_tx
+    num_scenes = total_samples // samples_per_scene
+    assert num_scenes * samples_per_scene == total_samples, "meta mismatch: total_samples not divisible by samples_per_scene"
 
-    n_train_scenes = int(round(cfg.train_frac * cfg.num_scenes))
+    scene_ids = rng.permutation(num_scenes)
+    n_train_scenes = int(round(cfg.train_frac * num_scenes))
     train_scenes = np.sort(scene_ids[:n_train_scenes])
     val_scenes   = np.sort(scene_ids[n_train_scenes:])
 
@@ -1137,8 +1471,12 @@ def main():
     "seed": int(cfg.seed),
     }, indent=2))
 
-    train_ds = MemmapIndexDataset(x_mm, y_mm, train_idx, stats, cfg.no_path_wb_db, K, y_ch, H, W, cfg.ex_loss_thresh_ns, cfg.tau_loss_thresh_ns, keep_idx=keep_idx)
-    val_ds   = MemmapIndexDataset(x_mm, y_mm, val_idx,   stats, cfg.no_path_wb_db, K, y_ch, H, W, cfg.ex_loss_thresh_ns, cfg.tau_loss_thresh_ns, keep_idx=keep_idx)
+    train_ds = MemmapIndexDataset(x_mm, y_mm, train_idx, stats, cfg.no_path_wb_db,
+                              K, y_ch, Hp, Wp, cfg.ex_loss_thresh_ns, cfg.tau_loss_thresh_ns,
+                              keep_idx=keep_idx)
+    val_ds   = MemmapIndexDataset(x_mm, y_mm, val_idx,   stats, cfg.no_path_wb_db,
+                                K, y_ch, Hp, Wp, cfg.ex_loss_thresh_ns, cfg.tau_loss_thresh_ns,
+                                keep_idx=keep_idx)
 
     train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, pin_memory=True)
     val_dl   = DataLoader(val_ds,   batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, pin_memory=True)
@@ -1341,7 +1679,7 @@ def main():
         dt = time.time() - t0
         print(f"ep {ep:03d}  train={tr_loss:.4f}  val={va_loss:.4f}  ({dt:.1f}s)")
 
-        metrics = report_metrics(model, val_dl, stats_dev, y_ch, H, W, tag="val")
+        metrics = report_metrics(model, val_dl, stats_dev, y_ch, Hp, Wp, tag="val")
 
         
         row = {"epoch": ep, "train_loss": float(tr_loss), "val_loss": float(va_loss)}
@@ -1358,7 +1696,7 @@ def main():
             print("  saved best state:", state_path)
 
             # TorchScript export (state dict + scripted)
-            example = torch.randn(1, in_ch, H, W, device=cfg.device)
+            example = torch.randn(1, in_ch, Hp, Wp, device=cfg.device)
             try:
                 scripted = torch.jit.script(model)
                 scripted.save(str(jit_path))
