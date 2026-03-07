@@ -38,7 +38,7 @@ C0 = 299_792_458.0
 class CFG:
     # fine-tune output / base run
     out_dir: str = "runs/delta_3072_offpatch_finetune"
-    base_run: str = "runs/delta_3072_Jan20_diff"
+    base_run: str = "runs/delta_3072_10int"
 
     # local patch fed to the U-Net (must match pretrained run)
     img_hw: tuple[int, int] = (64, 64)
@@ -69,7 +69,7 @@ class CFG:
     rx_batch: int = 256
     no_path_wb_db: float = 199.5
     rt: RtCfg = field(default_factory=lambda: RtCfg(
-        max_depth=5,
+        max_depth=10,
         samples_per_src=1_000_000,
         diffuse_reflection=True,
         diffraction=True,
@@ -431,7 +431,6 @@ def sample_patch_top_left(
 def make_patch_scene_from_full(base_scene: Scene, tx_xyz_m: np.ndarray, full_meta: dict, i0: int, j0: int) -> Scene:
     patch_H, patch_W = cfg.img_hw
 
-    # Match the inference-side local grid convention used in ns3unet_spectrum.py
     origin = np.asarray([
         i0 * cfg.scale,
         j0 * cfg.scale,
@@ -448,11 +447,13 @@ def make_patch_scene_from_full(base_scene: Scene, tx_xyz_m: np.ndarray, full_met
         shape=(cfg.K_slices, patch_H, patch_W),
     )
 
-    xs = origin[0] + cfg.scale * np.arange(patch_W, dtype=np.float32)
-    ys = origin[1] + cfg.scale * np.arange(patch_H, dtype=np.float32)
-    zs = origin[2] + full_meta["z_step_m"] * np.arange(cfg.K_slices, dtype=np.float32)
-    Z, Y, X = np.meshgrid(zs, ys, xs, indexing="ij")
-    rx_coords = np.stack([X, Y, Z], axis=-1).reshape(-1, 3).astype(np.float32)
+    k, i, j = np.meshgrid(
+        np.arange(cfg.K_slices),
+        np.arange(patch_H),
+        np.arange(patch_W),
+        indexing="ij",
+    )
+    rx_coords = rx_grid.ijk2xyz(i, j, k).reshape(-1, 3).astype(np.float32)
 
     adb = AntennaDatabase(
         tx_xyz_m.reshape(1, 3).astype(np.float32),
