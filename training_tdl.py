@@ -1219,8 +1219,8 @@ def main():
         # (equivalent to fspl + delta_hat without needing fspl inside loss_fn)
         wb_hat = wb_tgt + (delta_hat - delta_tgt)
 
-        g_hat = torch.pow(10.0, -wb_hat / 10.0)
-        g_tgt = torch.pow(10.0, -wb_tgt / 10.0)
+        g_hat = torch.pow(10.0, torch.clamp(-wb_hat / 10.0, min=-20.0, max=20.0))
+        g_tgt = torch.pow(10.0, torch.clamp(-wb_tgt / 10.0, min=-20.0, max=20.0))
 
         num = (((g_hat - g_tgt) ** 2) * mp).sum()
         den = (((g_tgt) ** 2) * mp).sum().clamp_min(1e-12)
