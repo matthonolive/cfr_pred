@@ -698,6 +698,24 @@ class ResBlock(nn.Module):
         h = self.conv2(h)
         return h + self.skip(x)
 
+class SelfAttention2d(nn.Module):
+    """Lightweight self-attention for small spatial resolutions."""
+    def __init__(self, ch: int):
+        super().__init__()
+        g = _valid_groups(ch, 8)
+        self.norm = nn.GroupNorm(g, ch)
+        self.qkv = nn.Conv2d(ch, ch * 3, 1)
+        self.proj = nn.Conv2d(ch, ch, 1)
+        self.scale = ch ** -0.5
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        qkv = self.qkv(h).reshape(B, 3, C, H * W)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+        attn = (q.transpose(-1, -2) @ k * self.scale).softmax(dim=-1)
+        out = (v @ attn).reshape(B, C, H, W)
+        return x + self.proj(out)
 
 class UNet3(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, base: int = 32, groups: int = 8, dropout: float = 0.1):
