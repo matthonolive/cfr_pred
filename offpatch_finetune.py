@@ -588,6 +588,7 @@ class MemmapIndexDataset(Dataset):
         ex_loss_thresh_ns: float,
         tau_loss_thresh_ns: float,
         keep_idx: np.ndarray | list[int] | None = None,
+        augment: bool = False
     ):
         self.x_mm = x_mm
         self.y_mm = y_mm
@@ -599,6 +600,8 @@ class MemmapIndexDataset(Dataset):
         self.y_ch = int(y_ch)
         self.H = int(H)
         self.W = int(W)
+
+        self.augment = augment
 
         self.ex_loss_thresh_ns = float(ex_loss_thresh_ns)
         self.tau_loss_thresh_ns = float(tau_loss_thresh_ns)
@@ -646,6 +649,21 @@ class MemmapIndexDataset(Dataset):
 
         x = (x - self.stats["x_mean"]) / self.stats["x_std"]
         y = (y - self.stats["y_mean"]) / self.stats["y_std"]
+
+        if self.augment:
+            k = torch.randint(0, 4, (1,)).item()
+            if k > 0:
+                x = torch.rot90(x, k, dims=(-2, -1))
+                y = torch.rot90(y, k, dims=(-2, -1))
+                mask_path = torch.rot90(mask_path, k, dims=(-2, -1))
+                mask_ex = torch.rot90(mask_ex, k, dims=(-2, -1))
+                mask_tau = torch.rot90(mask_tau, k, dims=(-2, -1))
+            if torch.rand(1).item() < 0.5:
+                x = torch.flip(x, dims=[-1])
+                y = torch.flip(y, dims=[-1])
+                mask_path = torch.flip(mask_path, dims=[-1])
+                mask_ex = torch.flip(mask_ex, dims=[-1])
+                mask_tau = torch.flip(mask_tau, dims=[-1])
 
         return x, y, mask_path.float(), mask_ex.float(), mask_tau.float()
 
@@ -795,8 +813,8 @@ def report_metrics(model, dl, stats_dev, y_ch: int, H: int, W: int, tag="val", m
         sum_tau_mae_path += ((tau_hat - tau_tgt).abs() * mp).sum().item()
         sum_wb_mae += ((wb_hat - wb_tgt).abs() * mp).sum().item()
 
-        g_hat = torch.pow(10.0, -wb_hat / 10.0)
-        g_tgt = torch.pow(10.0, -wb_tgt / 10.0)
+        g_hat = torch.pow(10.0, torch.clamp(-wb_hat / 10.0, min=-20.0, max=20.0))
+        g_tgt = torch.pow(10.0, torch.clamp(-wb_tgt / 10.0, min=-20.0, max=20.0))
         wb_nmse_num += (((g_hat - g_tgt) ** 2) * mp).sum().item()
         wb_nmse_den += (((g_tgt) ** 2) * mp).sum().clamp_min(1e-12).item()
 
@@ -851,8 +869,8 @@ def loss_fn(pred, tgt, m_path, m_ex, m_tau, y_mean, y_std, y_ch: int):
     wb_tgt = tgt3[:, :, 3:4] * y_std3[:, :, 3:4] + y_mean3[:, :, 3:4]
     wb_hat = wb_tgt + (delta_hat - delta_tgt)
 
-    g_hat = torch.pow(10.0, -wb_hat / 10.0)
-    g_tgt = torch.pow(10.0, -wb_tgt / 10.0)
+    g_hat = torch.pow(10.0, torch.clamp(-wb_hat / 10.0, min=-20.0, max=20.0))
+    g_tgt = torch.pow(10.0, torch.clamp(-wb_tgt / 10.0, min=-20.0, max=20.0))
     l_wb_gain_nmse = ((((g_hat - g_tgt) ** 2) * mp).sum() /
                       (((g_tgt) ** 2) * mp).sum().clamp_min(1e-12))
 
@@ -993,9 +1011,11 @@ def main():
         idx = 0
         for s in range(cfg.num_scenes):
             full_scene, walls_2d, full_meta = make_full_scene(rng)
-            tx_xyz = sample_free_tx_xyz(walls_2d, full_meta["ceiling_h_m"], rng)
+            
 
             for _ in range(cfg.patches_per_scene):
+
+                tx_xyz = sample_free_tx_xyz(walls_2d, full_meta["ceiling_h_m"], rng)
                 i0, j0 = sample_patch_top_left(
                     full_meta["full_H"], full_meta["full_W"], H, W, tx_xyz, rng
                 )
@@ -1056,7 +1076,7 @@ def main():
 
     train_ds = MemmapIndexDataset(
         x_mm, y_mm, train_idx, stats, cfg.no_path_wb_db, K, y_ch, H, W,
-        cfg.ex_loss_thresh_ns, cfg.tau_loss_thresh_ns, keep_idx=keep_idx,
+        cfg.ex_loss_thresh_ns, cfg.tau_loss_thresh_ns, keep_idx=keep_idx, augment = True
     )
     val_ds = MemmapIndexDataset(
         x_mm, y_mm, val_idx, stats, cfg.no_path_wb_db, K, y_ch, H, W,
@@ -1098,9 +1118,14 @@ def main():
             m_tau = m_tau.to(cfg.device, non_blocking=True)
 
             opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=(cfg.amp and cfg.device.startswith("cuda"))):
+            with torch.cuda.amp.autocast(enabled=(cfg.amp and cfg.device.startswith("cuda")), dtype=torch.bfloat16):
                 pred = model(xb)
                 loss = loss_fn(pred, yb, m_path, m_ex, m_tau, y_mean, y_std, y_ch)
+
+            if not torch.isfinite(loss):
+                print(f"  WARNING: non-finite loss, skipping batch")
+                opt.zero_grad(set_to_none=True)
+                continue
 
             scaler.scale(loss).backward()
             if cfg.grad_clip and cfg.grad_clip > 0:
