@@ -93,8 +93,8 @@ class CFG:
     batch_size: int = 8
     num_workers: int = 2
     lr: float = 2e-4
-    epochs: int = 30
-    base: int = 32
+    epochs: int = 40
+    base: int =48
     groups: int = 8
     dropout: float = 0.1
     grad_clip: float = 1.0
@@ -1162,7 +1162,7 @@ def main():
 
     scheduler = OneCycleLR(
         opt,
-        max_lr=cfg.lr * 5,          # peaks at 1e-3 then decays
+        max_lr=cfg.lr * 3,          # peaks at 1e-3 then decays
         epochs=cfg.epochs,
         steps_per_epoch=len(train_dl),
         pct_start=0.1,              # 10% warmup
@@ -1328,10 +1328,15 @@ def main():
             m_tau = m_tau.to(cfg.device, non_blocking=True)
 
             opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=(cfg.amp and cfg.device.startswith("cuda"))):
+            with torch.cuda.amp.autocast(enabled=(cfg.amp and cfg.device.startswith("cuda")), dtype=torch.bfloat16):
                 pred = model(xb)
                 loss = loss_fn(pred, yb, m_path, m_ex, m_tau, y_mean, y_std)
 
+            if not torch.isfinite(loss):
+                print(f"  WARNING: non-finite loss ({loss.item():.4f}), skipping batch")
+                opt.zero_grad(set_to_none=True)
+                scheduler.step()
+                continue
             scaler.scale(loss).backward()
             if cfg.grad_clip and cfg.grad_clip > 0:
                 scaler.unscale_(opt)
