@@ -100,7 +100,7 @@ class CFG:
     num_workers: int = 2
     lr: float = 5e-5
     epochs: int = 10
-    base: int = 32
+    base: int = 48
     groups: int = 8
     dropout: float = 0.1
     grad_clip: float = 1.0
