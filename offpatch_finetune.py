@@ -722,6 +722,7 @@ class UNet3(nn.Module):
 
         self.mid = nn.Sequential(
             ResBlock(base * 4, base * 8, groups=groups, dropout=dropout),
+            SelfAttention2d(base * 8),
             ResBlock(base * 8, base * 8, groups=groups, dropout=dropout),
         )
 
