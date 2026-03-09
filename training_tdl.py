@@ -10,6 +10,7 @@ import time
 
 import numpy as np
 import polars as pl
+import matplotlib.pyplot as plt
 
 from scipy.ndimage import gaussian_filter, generic_filter
 
@@ -17,6 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import OneCycleLR
 
 # mlink
 from mlink.antenna import AntennaGrid, AntennaDatabase
@@ -32,7 +34,7 @@ C0 = 299_792_458.0
 # ----------------------------
 @dataclass
 class CFG:
-    out_dir: str = "runs/delta_3072_Jan20_diff"
+    out_dir: str = "runs/delta_3072_10int"
 
     # scene / grids
     frequency_hz: float = 5.21e9
@@ -59,7 +61,7 @@ class CFG:
     rx_batch: int = 256
     no_path_wb_db: float = 199.5  # compute_tdl_batch uses 200 dB sentinel
     rt: RtCfg = field(default_factory=lambda: RtCfg(
-        max_depth=5,
+        max_depth=10,
         samples_per_src=1_000_000,
         diffuse_reflection=True,
         diffraction=True,
@@ -83,7 +85,7 @@ class CFG:
     smooth_gauss_sigma: float = 1.0
 
     # dataset size
-    num_scenes: int = 100
+    num_scenes: int = 200
     train_frac: float = 0.8
     seed: int = 20001999
 
@@ -433,6 +435,7 @@ class MemmapIndexDataset(Dataset):
         ex_loss_thresh_ns: float,
         tau_loss_thresh_ns: float,
         keep_idx: np.ndarray | list[int] | None = None,
+        augment: bool = False,
     ):
         self.x_mm = x_mm
         self.y_mm = y_mm
@@ -444,6 +447,8 @@ class MemmapIndexDataset(Dataset):
         self.y_ch = int(y_ch)
         self.H = int(H)
         self.W = int(W)
+
+        self.augment = augment
 
         self.ex_loss_thresh_ns = float(ex_loss_thresh_ns)
         self.tau_loss_thresh_ns = float(tau_loss_thresh_ns)
@@ -499,11 +504,32 @@ class MemmapIndexDataset(Dataset):
         x = torch.from_numpy(x_np)
         y = torch.from_numpy(y_tf)
 
+
         # normalize
         x = (x - self.stats["x_mean"]) / self.stats["x_std"]
         y = (y - self.stats["y_mean"]) / self.stats["y_std"]
 
-        return x, y, mask_path.float(), mask_ex.float(), mask_tau.float()
+        mask_path = mask_path.float()
+        mask_ex = mask_ex.float()
+        mask_tau = mask_tau.float()
+
+        # data augmentation: random rot90 + optional flip (8 symmetries)
+        if self.augment:
+            k = torch.randint(0, 4, (1,)).item()
+            if k > 0:
+                x = torch.rot90(x, k, dims=(-2, -1))
+                y = torch.rot90(y, k, dims=(-2, -1))
+                mask_path = torch.rot90(mask_path, k, dims=(-2, -1))
+                mask_ex = torch.rot90(mask_ex, k, dims=(-2, -1))
+                mask_tau = torch.rot90(mask_tau, k, dims=(-2, -1))
+            if torch.rand(1).item() < 0.5:
+                x = torch.flip(x, dims=[-1])
+                y = torch.flip(y, dims=[-1])
+                mask_path = torch.flip(mask_path, dims=[-1])
+                mask_ex = torch.flip(mask_ex, dims=[-1])
+                mask_tau = torch.flip(mask_tau, dims=[-1])
+
+        return x, y, mask_path, mask_ex, mask_tau
     
 
 def _valid_groups(ch: int, groups: int) -> int:
@@ -533,6 +559,24 @@ class ResBlock(nn.Module):
         h = self.conv2(h)
         return h + self.skip(x)
 
+class SelfAttention2d(nn.Module):
+    """Lightweight self-attention for small spatial resolutions."""
+    def __init__(self, ch: int):
+        super().__init__()
+        g = _valid_groups(ch, 8)
+        self.norm = nn.GroupNorm(g, ch)
+        self.qkv = nn.Conv2d(ch, ch * 3, 1)
+        self.proj = nn.Conv2d(ch, ch, 1)
+        self.scale = ch ** -0.5
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        qkv = self.qkv(h).reshape(B, 3, C, H * W)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+        attn = (q.transpose(-1, -2) @ k * self.scale).softmax(dim=-1)
+        out = (v @ attn).reshape(B, C, H, W)
+        return x + self.proj(out)
 
 class UNet3(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, base: int = 32, groups: int = 8, dropout: float = 0.1):
@@ -557,6 +601,7 @@ class UNet3(nn.Module):
 
         self.mid = nn.Sequential(
             ResBlock(base*4, base*8, groups=groups, dropout=dropout),
+            SelfAttention2d(base*8),
             ResBlock(base*8, base*8, groups=groups, dropout=dropout),
         )
 
@@ -788,6 +833,12 @@ def report_metrics(model, dl, stats_dev, y_ch: int, H: int, W: int,
     tau_nmse = safe_div(tau_nmse_num, tau_nmse_den)
     tau_nmse_db = 10.0 * math.log10(max(tau_nmse, 1e-12))
 
+    # TAU NMSE on all on-path pixels
+    tau_nmse_path_num = ((tau_err ** 2) * mp).sum().item()
+    tau_nmse_path_den = ((tau_tgt ** 2) * mp).sum().clamp_min(1e-12).item()
+    tau_nmse_path = tau_nmse_path_num / tau_nmse_path_den
+    tau_nmse_path_db = 10.0 * math.log10(max(tau_nmse_path, 1e-12))
+
     tau_leak = safe_div(sum_tau_abs_nopath, sum_nopath)
 
     print(
@@ -799,7 +850,33 @@ def report_metrics(model, dl, stats_dev, y_ch: int, H: int, W: int,
         f"        tau_MAE(path)={tau_mae_path:.3f} ns | tau_RMSE(path)={tau_rmse_path:.3f} ns | "
         f"tau_MAE(tail)={tau_mae_tail:.3f} ns | tau_RMSE(tail)={tau_rmse_tail:.3f} ns | "
         f"tau_NMSE(tail)={tau_nmse:.4f} ({tau_nmse_db:.1f} dB) | tau_leak(no-path)={tau_leak:.3f} ns"
+        f"        tau_NMSE(path)={tau_nmse_path:.4f} ({tau_nmse_path_db:.1f} dB)"
     )
+
+    return {
+        "delta_mae_db": float(delta_mae),
+        "delta_mae_hard_db": float(delta_mae_hard),
+        "wb_mae_db": float(wb_mae),
+        "wb_nmse": float(wb_nmse),
+        "wb_nmse_db": float(wb_nmse_db),
+
+        "ex_mae_path_ns": float(ex_mae_path),
+        "ex_rmse_path_ns": float(ex_rmse_path),
+        "ex_mae_tail_ns": float(ex_mae_tail),
+        "ex_rmse_tail_ns": float(ex_rmse_tail),
+        "ex_nmse": float(ex_nmse),
+        "ex_nmse_db": float(ex_nmse_db),
+        "ex_leak_nopath_ns": float(ex_leak),
+
+        "tau_mae_path_ns": float(tau_mae_path),
+        "tau_rmse_path_ns": float(tau_rmse_path),
+        "tau_mae_tail_ns": float(tau_mae_tail),
+        "tau_rmse_tail_ns": float(tau_rmse_tail),
+        "tau_nmse": float(tau_nmse),
+        "tau_nmse_db": float(tau_nmse_db),
+        "tau_leak_nopath_ns": float(tau_leak),
+    }
+
 
 
 ### TAU RMS Helpers ###
@@ -1048,6 +1125,8 @@ def main():
     # split train and validation by scene
     rng = np.random.default_rng(cfg.seed)
 
+
+    ###JERGER###
     samples_per_scene = num_tx   # for 2.5D
     scene_ids = rng.permutation(cfg.num_scenes)
 
@@ -1062,6 +1141,7 @@ def main():
     train_idx = np.concatenate([scene_to_indices(s) for s in train_scenes])
     val_idx   = np.concatenate([scene_to_indices(s) for s in val_scenes])
 
+
     (out_dir/"split.json").write_text(json.dumps({
     "train_scenes": train_scenes.tolist(),
     "val_scenes": val_scenes.tolist(),
@@ -1069,7 +1149,7 @@ def main():
     "seed": int(cfg.seed),
     }, indent=2))
 
-    train_ds = MemmapIndexDataset(x_mm, y_mm, train_idx, stats, cfg.no_path_wb_db, K, y_ch, H, W, cfg.ex_loss_thresh_ns, cfg.tau_loss_thresh_ns, keep_idx=keep_idx)
+    train_ds = MemmapIndexDataset(x_mm, y_mm, train_idx, stats, cfg.no_path_wb_db, K, y_ch, H, W, cfg.ex_loss_thresh_ns, cfg.tau_loss_thresh_ns, keep_idx=keep_idx, augment=True)
     val_ds   = MemmapIndexDataset(x_mm, y_mm, val_idx,   stats, cfg.no_path_wb_db, K, y_ch, H, W, cfg.ex_loss_thresh_ns, cfg.tau_loss_thresh_ns, keep_idx=keep_idx)
 
     train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, pin_memory=True)
@@ -1079,6 +1159,14 @@ def main():
     model = UNet3(in_ch=in_ch, out_ch=y_ch*K, base=cfg.base, groups=cfg.groups, dropout=cfg.dropout).to(cfg.device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     scaler = torch.cuda.amp.GradScaler(enabled=(cfg.amp and cfg.device.startswith("cuda")))
+
+    scheduler = OneCycleLR(
+        opt,
+        max_lr=cfg.lr * 5,          # peaks at 1e-3 then decays
+        epochs=cfg.epochs,
+        steps_per_epoch=len(train_dl),
+        pct_start=0.1,              # 10% warmup
+    )
 
     def loss_fn(pred, tgt, m_path, m_ex, m_tau, y_mean, y_std):
         """
@@ -1181,6 +1269,50 @@ def main():
             + 0.8 * l_tau
         )
 
+    ###Logging tools
+    def save_history_csv(history, path: Path):
+        # history: list[dict]
+        df = pl.DataFrame(history)
+        df.write_csv(path)
+
+    def plot_history(history, out_dir: Path):
+        df = pl.DataFrame(history)
+        # convert to numpy for plotting
+        ep = df["epoch"].to_numpy()
+
+        # --- Loss curves ---
+        plt.figure()
+        plt.plot(ep, df["train_loss"].to_numpy(), label="train_loss")
+        plt.plot(ep, df["val_loss"].to_numpy(), label="val_loss")
+        plt.xlabel("epoch"); plt.ylabel("loss"); plt.legend(); plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(out_dir / "curve_loss.png", dpi=150)
+        plt.close()
+
+        # --- WB / delta ---
+        plt.figure()
+        #plt.plot(ep, df["wb_mae_db"].to_numpy(), label="wb_mae_db")
+        plt.plot(ep, df["wb_nmse_db"].to_numpy(), label="wb_nmse_db")
+        plt.plot(ep, df["delta_mae_db"].to_numpy(), label="delta_mae_db")
+        plt.plot(ep, df["delta_mae_hard_db"].to_numpy(), label="delta_mae_hard_db")
+        plt.xlabel("epoch"); plt.ylabel("dB"); plt.legend(); plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(out_dir / "curve_wb_delta.png", dpi=150)
+        plt.close()
+
+        # --- Delays ---
+        plt.figure()
+        plt.plot(ep, df["ex_mae_path_ns"].to_numpy(), label="ex_mae_path_ns")
+        plt.plot(ep, df["ex_mae_tail_ns"].to_numpy(), label="ex_mae_tail_ns")
+        plt.plot(ep, df["tau_mae_path_ns"].to_numpy(), label="tau_mae_path_ns")
+        plt.plot(ep, df["tau_mae_tail_ns"].to_numpy(), label="tau_mae_tail_ns")
+        plt.xlabel("epoch"); plt.ylabel("ns"); plt.legend(); plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(out_dir / "curve_delays.png", dpi=150)
+        plt.close()
+
+    history = []
+    history_csv = out_dir/"history.csv"
     # training loop
     best_val = float("inf")
     for ep in range(1, cfg.epochs + 1):
@@ -1206,6 +1338,7 @@ def main():
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             scaler.step(opt)
             scaler.update()
+            scheduler.step()
 
             tr_loss += loss.item()
 
@@ -1228,7 +1361,16 @@ def main():
         dt = time.time() - t0
         print(f"ep {ep:03d}  train={tr_loss:.4f}  val={va_loss:.4f}  ({dt:.1f}s)")
 
-        report_metrics(model, val_dl, stats_dev, y_ch, H, W, tag="val")
+        metrics = report_metrics(model, val_dl, stats_dev, y_ch, H, W, tag="val")
+
+        
+        row = {"epoch": ep, "train_loss": float(tr_loss), "val_loss": float(va_loss)}
+        row.update(metrics)
+        history.append(row)
+
+        save_history_csv(history, history_csv)
+        plot_history(history, out_dir)
+        print("  wrote:", history_csv, "and updated plots")
 
         if va_loss < best_val:
             best_val = va_loss
