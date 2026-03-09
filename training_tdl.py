@@ -760,8 +760,8 @@ def report_metrics(model, dl, stats_dev, y_ch: int, H: int, W: int,
         # ---------------- WB on path ----------------
         sum_wb_mae += ((wb_hat - wb_tgt).abs() * mp).sum().item()
 
-        g_hat = torch.pow(10.0, -wb_hat / 10.0)
-        g_tgt = torch.pow(10.0, -wb_tgt / 10.0)
+        g_hat = torch.pow(10.0, torch.clamp(-wb_hat / 10.0, min=-20.0, max=20.0))
+        g_tgt = torch.pow(10.0, torch.clamp(-wb_tgt / 10.0, min=-20.0, max=20.0))
         wb_nmse_num += (((g_hat - g_tgt) ** 2) * mp).sum().item()
         wb_nmse_den += (((g_tgt) ** 2) * mp).sum().clamp_min(1e-12).item()
 
