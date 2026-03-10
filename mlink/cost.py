@@ -33,7 +33,7 @@ def build_transmission_coeffs(mi_scene: mi.Scene, frequency: float) -> dr.auto.a
         )
         r = (1 - np.sqrt(eta_complex)) / (1 + np.sqrt(eta_complex))
         q = 2 * pi * d * frequency / FREE_SPACE_CONSTS.c
-        t = (np.square(1 - r) * np.exp(-1j * q)) / (1 - np.square(r) * np.exp(-2j * q))
+        t = ((1 - np.square(r)) * np.exp(-1j * q)) / (1 - np.square(r) * np.exp(-2j * q))
         transmission_coeffs[i] = np.abs(t)
 
     return dr.auto.ad.Float(transmission_coeffs)
