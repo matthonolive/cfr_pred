@@ -1,16 +1,16 @@
 import json
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.ndimage import median_filter
+from scipy.ndimage import gaussian_filter
 from pathlib import Path
 import torch
 
 # ── Config ──────────────────────────────────────────────────────────────
-out_dir   = Path("runs/delta_3072_10int_merged")
-med_size  = 6                       # median filter kernel size
-sample_idx = 0                      # which sample to visualise
-k_slice    = 0                      # which height slice (0..K-1)
-no_path    = 199.5                  # sentinel for "no propagation path"
+out_dir    = Path("runs/delta_3072_10int_merged")
+gauss_sigma = 2.0                    # Gaussian blur σ (pixels)
+sample_idx  = 0                      # which sample to visualise
+k_slice     = 0                      # which height slice (0..K-1)
+no_path     = 199.5                  # sentinel for "no propagation path"
 
 # ── Load metadata & memmaps ─────────────────────────────────────────────
 meta = json.loads((out_dir / "meta.json").read_text())
@@ -28,12 +28,11 @@ y_mm = np.memmap(out_dir / "y.dat", dtype="float16", mode="r",
 
 # ── Load normalisation stats ────────────────────────────────────────────
 stats = np.load(out_dir / "norm_stats.npz")
-x_mean = stats["x_mean"]            # (in_ch, 1, 1) or (in_ch,)
+x_mean = stats["x_mean"]
 x_std  = stats["x_std"]
-y_mean = stats["y_mean"]            # (y_ch*K, 1, 1) or (y_ch*K,)
+y_mean = stats["y_mean"]
 y_std  = stats["y_std"]
 
-# reshape stats to (C,1,1) if needed
 if x_mean.ndim == 1: x_mean = x_mean[:, None, None]
 if x_std.ndim  == 1: x_std  = x_std[:, None, None]
 if y_mean.ndim == 1: y_mean = y_mean[:, None, None]
@@ -49,34 +48,34 @@ i = sample_idx
 
 # --- label (physical space) ---
 y_phys = np.array(y_mm[i], dtype=np.float32)          # (y_ch*K, H, W)
-delta_ch = k_slice * y_ch + 0                           # delta channel index
-wb_ch    = k_slice * y_ch + 3                            # wb   channel index
+delta_ch = k_slice * y_ch + 0
+wb_ch    = k_slice * y_ch + 3
 
-delta_label = y_phys[delta_ch]                           # (H, W)
-wb_label    = y_phys[wb_ch]                              # (H, W)
-mask = wb_label < no_path                                # True where a path exists
+delta_label = y_phys[delta_ch]                          # (H, W)
+wb_label    = y_phys[wb_ch]
+mask = wb_label < no_path                               # True where path exists
 
-# --- median-blurred label ---
-delta_blurred = median_filter(delta_label, size=med_size).astype(np.float32)
+# --- Gaussian-blurred label ---
+delta_blurred = gaussian_filter(delta_label, sigma=gauss_sigma).astype(np.float32)
 
 # --- U-Net prediction (forward pass) ---
-x_full = np.array(x_mm[i], dtype=np.float32)            # (c_in*K, H, W)
-x_kept = x_full[keep_idx]                                # (in_ch, H, W)
-x_norm = (x_kept - x_mean) / x_std                      # normalise
+x_full = np.array(x_mm[i], dtype=np.float32)
+x_kept = x_full[keep_idx]
+x_norm = (x_kept - x_mean) / x_std
 
-x_t = torch.from_numpy(x_norm[None]).to(device)          # (1, in_ch, H, W)
+x_t = torch.from_numpy(x_norm[None]).to(device)
 with torch.no_grad():
-    pred_norm = model(x_t).cpu().numpy()[0]               # (y_ch*K, H, W)
+    pred_norm = model(x_t).cpu().numpy()[0]              # (y_ch*K, H, W)
 
 # unnormalise prediction → physical units
 ys = y_std.reshape(-1, 1, 1) if y_std.ndim != 3 else y_std
 ym = y_mean.reshape(-1, 1, 1) if y_mean.ndim != 3 else y_mean
 pred_phys = pred_norm * ys + ym
 
-delta_pred = pred_phys[delta_ch]                          # (H, W)
+delta_pred = pred_phys[delta_ch]
 
 # --- error map: prediction minus blurred label ---
-error_map = delta_pred - delta_blurred                    # (H, W)
+error_map = delta_pred - delta_blurred
 
 # mask out no-path pixels for display
 delta_blurred_disp = np.where(mask, delta_blurred, np.nan)
@@ -85,7 +84,7 @@ error_disp         = np.where(mask, error_map,     np.nan)
 
 # ── Print summary stats on the error (on-path only) ────────────────────
 err_valid = error_map[mask]
-print(f"Sample {i}, k={k_slice}, median {med_size}x{med_size}")
+print(f"Sample {i}, k={k_slice}, Gaussian σ={gauss_sigma}")
 print(f"  on-path pixels : {mask.sum()}")
 print(f"  error  mean    : {err_valid.mean():.3f} dB")
 print(f"  error  std     : {err_valid.std():.3f} dB")
@@ -96,11 +95,11 @@ print(f"  error  p90 abs : {np.percentile(np.abs(err_valid), 90):.3f} dB")
 fig, axes = plt.subplots(1, 3, figsize=(16, 5))
 
 im0 = axes[0].imshow(delta_blurred_disp, cmap="inferno", origin="upper")
-axes[0].set_title(f"Median-blurred Δ (dB)\n({med_size}×{med_size}), s={i}, k={k_slice}")
+axes[0].set_title(f"Gaussian-blurred Δ (dB)\nσ={gauss_sigma}")
 fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
 
 im1 = axes[1].imshow(delta_pred_disp, cmap="inferno", origin="upper")
-axes[1].set_title(f"U-Net predicted Δ (dB)\ns={i}, k={k_slice}")
+axes[1].set_title(f"U-Net predicted Δ (dB)")
 fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
 
 vabs = max(abs(np.nanmin(error_disp)), abs(np.nanmax(error_disp)))
@@ -109,11 +108,7 @@ im2 = axes[2].imshow(error_disp, cmap="RdBu_r", origin="upper",
 axes[2].set_title(f"Error: pred − blurred (dB)\nMAE={np.mean(np.abs(err_valid)):.2f} dB")
 fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
 
-for ax in axes:
-    ax.set_xlabel("x (px)")
-    ax.set_ylabel("y (px)")
-
 fig.tight_layout()
-fig.savefig(out_dir / "median_vs_unet.png", dpi=200)
+fig.savefig(out_dir / "gaussian_vs_unet.png", dpi=200)
 plt.show()
-print(f"Saved → {out_dir / 'median_vs_unet.png'}")
+print(f"Saved → {out_dir / 'gaussian_vs_unet.png'}")
