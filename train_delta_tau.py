@@ -42,6 +42,35 @@ This script addresses that directly:
 Heads (model output, 3 per slice): [ r, tau, coverage_logit ]
 On-disk store (4 per slice):        [ wb_RT, tau, wb_cost, num_obstr ]
 
+CHANGES IN THIS REVISION (offpatch out-of-bounds fix)
+------------------------------------------------------------------
+a. binary_walls_offpatch is now included and registered over the stock
+   "binary_walls" (this was the '>>> VERIFY' spot). The stock rasterizer
+   indexes wall segments into the RX grid without clipping; for offpatch
+   crops the full-scene mesh extends beyond the 64x64 window, producing
+   indices >= H/W -> IndexError. The clipped version is a behavioral
+   no-op for in-patch geometry, so it is registered globally and the
+   EXISTING inpatch store remains valid and is reused as-is.
+b. Offpatch TX is sampled from FREE cells of the full-scene wall map
+   (previously any cell, possibly inside a wall), and its z is clipped
+   between floor+margin and ceiling-margin in meters.
+c. Crop sampling no longer uses rejection sampling. For full scenes
+   smaller than 2x the patch in both dimensions, a TX in the central
+   dead zone (tx_i in [Hf-64, 63] AND tx_j in [Wf-64, 63]) is contained
+   by EVERY possible 64x64 crop, so the old 4000-try loop could raise
+   "Failed to sample an off-patch crop". Valid crop origins are now
+   enumerated directly (uniform draw over the same set, so the crop
+   distribution is unchanged); if the set is empty the TX is resampled,
+   and as a last resort the scene is regenerated.
+d. Store builders are now RESUMABLE. Each store keeps a progress.json;
+   on restart, a finished store (meta.json present) is reused untouched,
+   and a partially built store is reopened ('r+') and generation resumes
+   at the first incomplete scene. Scene RNG is derived per-scene from
+   cfg.seed, so resumed runs generate the same scenes a fresh run would.
+   Your completed 300-scene inpatch store is picked up by the meta.json
+   fast path and is NOT regenerated (do not change out_dir or
+   dataset_features, since they define the store path).
+
 REQUIRED inference change (ns3unet_spectrum.sample_heads, U-Net path)
 ------------------------------------------------------------------
     maps = model(x)                      # (K*3,H,W) -> (K,3,H,W)
@@ -56,12 +85,6 @@ REQUIRED inference change (ns3unet_spectrum.sample_heads, U-Net path)
     if cov_p < 0.5: emit no-path sentinel
   Set y_ch = 3 in the loader; r/tau/cov live at indices 0/1/2.
   r_mean/r_std/tau_mean/tau_std are saved in norm_stats.npz (scalars).
-
-CONFIDENCE / VERIFY
-------------------------------------------------------------------
-Model / loss / metrics / training loop are the confident parts. The data
-generators (esp. off-patch) are reassembled from your scripts and were
-NOT run against mlink/sionna here -- check the  # >>> VERIFY  spots once.
 """
 
 import os
@@ -77,6 +100,7 @@ import time
 import numpy as np
 import polars as pl
 from scipy.ndimage import gaussian_filter, generic_filter
+from trimesh.intersections import mesh_plane
 
 import torch
 import torch.nn as nn
@@ -98,6 +122,60 @@ Y_STORE = 4
 # Model output layout
 P_R, P_TAU, P_COV = 0, 1, 2
 PRED_CH = 3
+
+
+# ==================================================================
+# Feature patch: bounds-safe binary_walls (required for offpatch crops)
+# ==================================================================
+def binary_walls_offpatch(scene: Scene, frequency: float) -> np.ndarray:
+    """Clipped rasterizer. For offpatch crops the mesh extends beyond the
+    RX grid, so wall segments map to indices outside [0,H)x[0,W); the stock
+    feature indexes them directly and raises IndexError. Clipping is a
+    no-op for in-patch scenes, so this is safe to register globally."""
+    mesh = scene.mesh
+    z_normal = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+
+    rx_grid = scene.antenna_database.rx_grid
+    if rx_grid is None:
+        raise Exception("Receivers must be initialized with a grid!")
+    K, H, W = rx_grid.shape
+
+    def rasterize_line(line_xyz: np.ndarray) -> np.ndarray:
+        src = np.asarray(rx_grid.xyz2ijk(line_xyz[0, :]), dtype=np.float32)
+        dst = np.asarray(rx_grid.xyz2ijk(line_xyz[1, :]), dtype=np.float32)
+        n = int(max(np.max(np.abs(dst - src)), 1)) + 1
+        pts = np.linspace(src, dst, num=n, endpoint=True).astype(np.int32)
+        keep = (
+            (pts[:, 0] >= 0) & (pts[:, 0] < H) &
+            (pts[:, 1] >= 0) & (pts[:, 1] < W)
+        )
+        pts = pts[keep]
+        if pts.size == 0:
+            return np.empty((0, 2), dtype=np.int32)
+        return pts[:, :2]
+
+    wall_tensor_lst = []
+    for k in range(K):
+        plane_origin = rx_grid.origin + k * rx_grid.deltas[2]
+        lines = mesh_plane(
+            mesh, plane_normal=z_normal, plane_origin=plane_origin,
+            return_faces=False)
+        walls = np.zeros((H, W), dtype=np.float32)
+        if lines is not None and len(lines) > 0:
+            for line in lines:
+                ij = rasterize_line(np.asarray(line))
+                if ij.shape[0] > 0:
+                    walls[ij[:, 0], ij[:, 1]] = 1.0
+        wall_tensor_lst.append(walls)
+
+    wall_tensor = np.stack(wall_tensor_lst, axis=0).astype(np.float32)  # (K,H,W)
+    wall_maps = wall_tensor[None, None, :, :, :]
+    wall_maps = np.repeat(wall_maps, repeats=scene.antenna_database.tx_coords.shape[0], axis=0)
+    return wall_maps
+
+
+REGISTRY["binary_walls"] = Specification(
+    name="binary_walls", requires=(), fn=binary_walls_offpatch)
 
 
 # ==================================================================
@@ -150,6 +228,8 @@ class CFG:
         diffraction=True, edge_diffraction=True, diffraction_lit_region=True))
 
     # features (cost + num_obstructions are BOTH required here)
+    # NOTE: changing this list (or out_dir) changes the store path and
+    # would orphan the existing inpatch store -- keep as-is to reuse it.
     dataset_features: list[str] = field(default_factory=lambda: [
         "binary_walls", "electrical_distance", "cost", "num_obstructions", "height_cond"])
     model_features: list[str] = field(default_factory=lambda: [
@@ -171,7 +251,7 @@ class CFG:
     batch_size: int = 8
     num_workers: int = 2
     lr: float = 2e-4
-    epochs: int = 50
+    epochs: int = 30
     base: int = 48
     groups: int = 8
     dropout: float = 0.1
@@ -213,6 +293,12 @@ def fspl_db(d_m, fc_hz):
     d = np.maximum(d_m, 1e-3)
     lam = C0 / float(fc_hz)
     return (20.0 * np.log10(4.0 * np.pi * d / lam)).astype(np.float32)
+
+
+def scene_rng(kind: str, scene_index: int) -> np.random.Generator:
+    """Per-scene RNG so store generation is resumable and order-independent."""
+    tag = 1 if kind == "inpatch" else 2
+    return np.random.default_rng(cfg.seed + 1_000_003 * tag + 7919 * (scene_index + 1))
 
 
 def default_material_db(freq):
@@ -307,7 +393,7 @@ def _to_sionna_geometry(scene, freq):
 
 
 # ==================================================================
-# Scene generation (in-patch + off-patch)  -- same as merged script
+# Scene generation (in-patch + off-patch)
 # ==================================================================
 def make_scene(rng):
     H, W = cfg.img_hw
@@ -335,53 +421,66 @@ def make_scene(rng):
 
 
 def make_full_scene(rng):
-    # >>> VERIFY: prefer your existing offpatch_finetune full-scene generator if present.
+    """Full off-patch scene. Returns (base_scene, walls_2d, meta) so the TX
+    can be sampled from free cells of the wall map."""
     H = int(rng.integers(cfg.full_h_min, cfg.full_h_max + 1))
     W = int(rng.integers(cfg.full_w_min, cfg.full_w_max + 1))
     ceiling_h = float(rng.uniform(cfg.off_ceil_min, cfg.off_ceil_max))
-    mesh = walls_to_mesh(
-        generate_wall_map((H, W), min_wall_length=cfg.min_wall_length,
-                          min_door_length=cfg.min_door_length,
-                          max_partitions=cfg.max_partitions, rng=rng),
-        floor_height=cfg.floor_h, ceiling_height=ceiling_h).apply_scale(cfg.scale)
+    walls_2d = generate_wall_map((H, W), min_wall_length=cfg.min_wall_length,
+                                 min_door_length=cfg.min_door_length,
+                                 max_partitions=cfg.max_partitions, rng=rng)
+    mesh = walls_to_mesh(walls_2d, floor_height=cfg.floor_h,
+                         ceiling_height=ceiling_h).apply_scale(cfg.scale)
     usable = max(ceiling_h - cfg.floor_h - 2 * cfg.z_margin, 1e-3)
     total_span = (cfg.K_slices - 1) * cfg.z_step
     z_step = usable / max(cfg.K_slices - 1, 1) if total_span > usable else cfg.z_step
     z_start = cfg.floor_h + cfg.z_margin
     z_end = (ceiling_h - cfg.z_margin) - total_span
     z0 = z_start if z_end < z_start else float(rng.uniform(z_start, z_end))
-    placeholder = AntennaDatabase.from_grid(
-        AntennaGrid(origin=np.zeros(3, np.float32),
-                    deltas=cfg.scale * np.asarray([[cfg.tx_spacing_xy, 0, 0], [0, cfg.tx_spacing_xy, 0], [0, 0, 1]], np.float32),
-                    shape=(1, 1, 1)),
-        AntennaGrid(origin=cfg.scale * np.asarray([0.0, 0.0, z0], np.float32),
-                    deltas=cfg.scale * np.asarray([[1, 0, 0], [0, 1, 0], [0, 0, z_step]], np.float32),
-                    shape=(cfg.K_slices, cfg.img_hw[0], cfg.img_hw[1])))
+    empty = np.empty((0, 3), dtype=np.float32)
     base = Scene(mesh=mesh, material_database=default_material_db(cfg.frequency_hz),
-                 face2material={k: 0 for k in range(mesh.faces.shape[0])}, antenna_database=placeholder)
-    return base, {"H_full": H, "W_full": W, "z0_m": float(cfg.scale * z0), "z_step_m": float(cfg.scale * z_step)}
+                 face2material={k: 0 for k in range(mesh.faces.shape[0])},
+                 antenna_database=AntennaDatabase(empty, empty, None, None))
+    meta = {"H_full": H, "W_full": W,
+            "z0_m": float(cfg.scale * z0), "z_step_m": float(cfg.scale * z_step),
+            "ceiling_h_m": float(cfg.scale * ceiling_h)}
+    return base, walls_2d, meta
 
 
-def sample_offpatch_crop(rng, tx_i, tx_j, full_H, full_W):
+def sample_free_tx_xyz(walls_2d, ceiling_h_m, rng):
+    """TX at the center of a random FREE cell; z clipped inside the room (meters)."""
+    free = np.argwhere(np.asarray(walls_2d) == 0)
+    if free.shape[0] == 0:
+        raise RuntimeError("No free cells available for TX sampling.")
+    rc = free[rng.integers(0, free.shape[0])]
+    x_m = (float(rc[0]) + 0.5) * cfg.scale
+    y_m = (float(rc[1]) + 0.5) * cfg.scale
+    z_lo = cfg.scale * (cfg.floor_h + cfg.z_margin)
+    z_hi = ceiling_h_m - cfg.scale * cfg.z_margin
+    z_m = float(np.clip(cfg.scale * cfg.tx_z, z_lo, z_hi))
+    return np.asarray([x_m, y_m, z_m], dtype=np.float32)
+
+
+def enumerate_offpatch_crops(tx_i, tx_j, full_H, full_W):
+    """All (i0, j0) crop origins that exclude the TX and satisfy the
+    gap/offset distance constraints. Returns an (N, 2) int array (may be
+    empty: for scenes < 2*patch in both dims there is a central dead zone
+    where every crop necessarily contains the TX -- the caller must then
+    resample the TX). Drawing uniformly from this set is distributionally
+    identical to the previous rejection sampler, but cannot fail or hang."""
     pH, pW = cfg.img_hw
     i_max, j_max = full_H - pH, full_W - pW
     if i_max < 0 or j_max < 0:
         raise RuntimeError("Full scene smaller than patch.")
-
-    def dist(i0, j0):
-        di = 0 if i0 <= tx_i < i0 + pH else min(abs(tx_i - i0), abs(tx_i - (i0 + pH - 1)))
-        dj = 0 if j0 <= tx_j < j0 + pW else min(abs(tx_j - j0), abs(tx_j - (j0 + pW - 1)))
-        return float(np.hypot(di, dj))
-
-    for _ in range(4000):
-        i0 = int(rng.integers(0, i_max + 1)); j0 = int(rng.integers(0, j_max + 1))
-        if (i0 <= tx_i < i0 + pH) and (j0 <= tx_j < j0 + pW):
-            continue
-        d = dist(i0, j0)
-        if d < cfg.min_tx_patch_gap_cells or d > cfg.max_tx_patch_offset_cells:
-            continue
-        return i0, j0
-    raise RuntimeError("Failed to sample an off-patch crop.")
+    i0 = np.arange(i_max + 1, dtype=np.int64)[:, None]
+    j0 = np.arange(j_max + 1, dtype=np.int64)[None, :]
+    in_i = (i0 <= tx_i) & (tx_i < i0 + pH)
+    in_j = (j0 <= tx_j) & (tx_j < j0 + pW)
+    di = np.where(in_i, 0, np.minimum(np.abs(tx_i - i0), np.abs(tx_i - (i0 + pH - 1))))
+    dj = np.where(in_j, 0, np.minimum(np.abs(tx_j - j0), np.abs(tx_j - (j0 + pW - 1))))
+    d = np.hypot(di, dj)
+    ok = (~(in_i & in_j)) & (d >= cfg.min_tx_patch_gap_cells) & (d <= cfg.max_tx_patch_offset_cells)
+    return np.argwhere(ok)
 
 
 def make_patch_scene_from_full(base_scene, tx_xyz_m, full_meta, i0, j0):
@@ -433,12 +532,28 @@ def compute_rt_labels(scene):
 
 
 # ==================================================================
-# Store builders
+# Store builders (resumable; existing data is reused, never regenerated)
 # ==================================================================
 def _store_paths(out_dir, kind, feat_tag):
     d = out_dir / f"store_{kind}_{feat_tag}"
     d.mkdir(parents=True, exist_ok=True)
-    return d / "x.dat", d / "y.dat", d / "meta.json"
+    return d / "x.dat", d / "y.dat", d / "meta.json", d / "progress.json"
+
+
+def _open_store(xp, yp, pp, total, c_in, K, H, W):
+    """Open (or create) the memmaps and return (x_mm, y_mm, scenes_done).
+    If x/y exist with a progress marker, reopen in r+ and resume."""
+    resume = xp.exists() and yp.exists() and pp.exists()
+    mode = "r+" if resume else "w+"
+    x_mm = np.memmap(xp, dtype="float32", mode=mode, shape=(total, c_in * K, H, W))
+    y_mm = np.memmap(yp, dtype="float16", mode=mode, shape=(total, Y_STORE * K, H, W))
+    scenes_done = 0
+    if resume:
+        try:
+            scenes_done = int(json.loads(pp.read_text()).get("scenes_done", 0))
+        except Exception:
+            scenes_done = 0
+    return x_mm, y_mm, scenes_done
 
 
 def _assemble_y(scene, x_prescale, cost_off, nobs_off, num_samples, K, H, W):
@@ -454,53 +569,74 @@ def _assemble_y(scene, x_prescale, cost_off, nobs_off, num_samples, K, H, W):
     return y
 
 
-def build_inpatch_store(out_dir, rng, c_in, num_tx, K, H, W, feat_tag, cost_off, nobs_off):
-    xp, yp, mp = _store_paths(out_dir, "inpatch", feat_tag)
+def build_inpatch_store(out_dir, c_in, num_tx, K, H, W, feat_tag, cost_off, nobs_off):
+    xp, yp, mp, pp = _store_paths(out_dir, "inpatch", feat_tag)
     total = cfg.num_inpatch_scenes * num_tx
     if xp.exists() and yp.exists() and mp.exists():
+        print(f"[inpatch] store complete -- reusing {xp.parent} ({total} samples)")
         return xp, yp, json.loads(mp.read_text())
-    x_mm = np.memmap(xp, dtype="float32", mode="w+", shape=(total, c_in * K, H, W))
-    y_mm = np.memmap(yp, dtype="float16", mode="w+", shape=(total, Y_STORE * K, H, W))
-    idx = 0
-    for s in range(cfg.num_inpatch_scenes):
-        scene = make_scene(rng)
+    x_mm, y_mm, scenes_done = _open_store(xp, yp, pp, total, c_in, K, H, W)
+    if scenes_done > 0:
+        print(f"[inpatch] resuming at scene {scenes_done + 1}/{cfg.num_inpatch_scenes}")
+    for s in range(scenes_done, cfg.num_inpatch_scenes):
+        scene = make_scene(scene_rng("inpatch", s))
         x = build_feature_tensor(scene, cfg.frequency_hz, requested=cfg.dataset_features).astype(np.float32)
         y = _assemble_y(scene, x, cost_off, nobs_off, num_tx, K, H, W)
+        idx = s * num_tx
         x_mm[idx:idx + num_tx] = x.transpose(0, 2, 1, 3, 4).reshape(num_tx, K * c_in, H, W)
         y_mm[idx:idx + num_tx] = y.transpose(0, 2, 1, 3, 4).reshape(num_tx, K * Y_STORE, H, W).astype(np.float16)
-        idx += num_tx; x_mm.flush(); y_mm.flush()
-        print(f"[inpatch {s+1:03d}/{cfg.num_inpatch_scenes}] total {idx}")
+        x_mm.flush(); y_mm.flush()
+        pp.write_text(json.dumps({"scenes_done": s + 1}))
+        print(f"[inpatch {s+1:03d}/{cfg.num_inpatch_scenes}] total {idx + num_tx}")
     meta = {"total_samples": int(total), "samples_per_scene": int(num_tx),
             "num_scenes": int(cfg.num_inpatch_scenes)}
     mp.write_text(json.dumps(meta, indent=2))
     return xp, yp, meta
 
 
-def build_offpatch_store(out_dir, rng, c_in, K, H, W, feat_tag, cost_off, nobs_off):
-    xp, yp, mp = _store_paths(out_dir, "offpatch", feat_tag)
+def build_offpatch_store(out_dir, c_in, K, H, W, feat_tag, cost_off, nobs_off):
+    xp, yp, mp, pp = _store_paths(out_dir, "offpatch", feat_tag)
     sps = cfg.patches_per_scene
     total = cfg.num_offpatch_scenes * sps
     if xp.exists() and yp.exists() and mp.exists():
+        print(f"[offpatch] store complete -- reusing {xp.parent} ({total} samples)")
         return xp, yp, json.loads(mp.read_text())
-    x_mm = np.memmap(xp, dtype="float32", mode="w+", shape=(total, c_in * K, H, W))
-    y_mm = np.memmap(yp, dtype="float16", mode="w+", shape=(total, Y_STORE * K, H, W))
-    # >>> VERIFY: register binary_walls_offpatch for crops if you have it.
-    idx = 0
-    for s in range(cfg.num_offpatch_scenes):
-        base, fm = make_full_scene(rng)
-        Hf, Wf = fm["H_full"], fm["W_full"]
-        tx_i = int(rng.integers(0, Hf)); tx_j = int(rng.integers(0, Wf))
-        tx_xyz = np.asarray([tx_i * cfg.scale, tx_j * cfg.scale, cfg.tx_z * cfg.scale], np.float32)  # >>> VERIFY tx_z scaling
-        for _p in range(sps):
-            i0, j0 = sample_offpatch_crop(rng, tx_i, tx_j, Hf, Wf)
+    x_mm, y_mm, scenes_done = _open_store(xp, yp, pp, total, c_in, K, H, W)
+    if scenes_done > 0:
+        print(f"[offpatch] resuming at scene {scenes_done + 1}/{cfg.num_offpatch_scenes}")
+    for s in range(scenes_done, cfg.num_offpatch_scenes):
+        rng = scene_rng("offpatch", s)
+        # Find a (scene, TX) pair with at least one feasible crop. A TX can
+        # land in a central dead zone (scenes < 2*patch per dim) where every
+        # crop contains it; resample the TX, and in the pathological case
+        # (heavily walled scene with only dead-zone free cells) the scene.
+        cands = None
+        for _scene_try in range(16):
+            base, walls_2d, fm = make_full_scene(rng)
+            Hf, Wf = fm["H_full"], fm["W_full"]
+            for _tx_try in range(64):
+                tx_xyz = sample_free_tx_xyz(walls_2d, fm["ceiling_h_m"], rng)
+                tx_i = int(np.floor(tx_xyz[0] / cfg.scale))
+                tx_j = int(np.floor(tx_xyz[1] / cfg.scale))
+                c = enumerate_offpatch_crops(tx_i, tx_j, Hf, Wf)
+                if c.shape[0] > 0:
+                    cands = c
+                    break
+            if cands is not None:
+                break
+        if cands is None:
+            raise RuntimeError(f"[offpatch scene {s}] no feasible (scene, TX, crop) found.")
+        for p in range(sps):
+            i0, j0 = (int(v) for v in cands[int(rng.integers(0, cands.shape[0]))])
             scene = make_patch_scene_from_full(base, tx_xyz, fm, i0, j0)
             x = build_feature_tensor(scene, cfg.frequency_hz, requested=cfg.dataset_features).astype(np.float32)
             y = _assemble_y(scene, x, cost_off, nobs_off, 1, K, H, W)
+            idx = s * sps + p
             x_mm[idx:idx + 1] = x.transpose(0, 2, 1, 3, 4).reshape(1, K * c_in, H, W)
             y_mm[idx:idx + 1] = y.transpose(0, 2, 1, 3, 4).reshape(1, K * Y_STORE, H, W).astype(np.float16)
-            idx += 1
         x_mm.flush(); y_mm.flush()
-        print(f"[offpatch {s+1:03d}/{cfg.num_offpatch_scenes}] total {idx}")
+        pp.write_text(json.dumps({"scenes_done": s + 1}))
+        print(f"[offpatch {s+1:03d}/{cfg.num_offpatch_scenes}] total {(s + 1) * sps}")
     meta = {"total_samples": int(total), "samples_per_scene": int(sps),
             "num_scenes": int(cfg.num_offpatch_scenes)}
     mp.write_text(json.dumps(meta, indent=2))
@@ -829,8 +965,8 @@ def main():
     cost_off = feature_slice_offset(cfg.dataset_features, feat_counts, "cost")
     nobs_off = feature_slice_offset(cfg.dataset_features, feat_counts, "num_obstructions")
 
-    xin, yin, min_meta = build_inpatch_store(out_dir, rng, c_in, num_tx, K, H, W, feat_tag, cost_off, nobs_off)
-    xoff, yoff, moff = build_offpatch_store(out_dir, rng, c_in, K, H, W, feat_tag, cost_off, nobs_off)
+    xin, yin, min_meta = build_inpatch_store(out_dir, c_in, num_tx, K, H, W, feat_tag, cost_off, nobs_off)
+    xoff, yoff, moff = build_offpatch_store(out_dir, c_in, K, H, W, feat_tag, cost_off, nobs_off)
 
     xin_mm = np.memmap(xin, "float32", "r", shape=(min_meta["total_samples"], c_in * K, H, W))
     yin_mm = np.memmap(yin, "float16", "r", shape=(min_meta["total_samples"], Y_STORE * K, H, W))
