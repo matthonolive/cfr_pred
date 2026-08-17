@@ -46,6 +46,7 @@ class RtCfg:
     diffraction: bool = False
     edge_diffraction: bool = False
     diffraction_lit_region: bool = False
+    max_num_paths_per_src: int = 1_000_000
 
 C0 = 299_792_458.0 # speed of light in m/s
 
@@ -225,6 +226,7 @@ def compute_tdl_batch(
         diffraction=getattr(rt, "diffraction", False),
         edge_diffraction=getattr(rt, "edge_diffraction", False),
         diffraction_lit_region=getattr(rt, "diffraction_lit_region", False),
+        max_num_paths_per_src=getattr(rt, "max_num_paths_per_src", 1_000_000),
     )
 
     # CIR for absolute delays (normalize_delays=False) :contentReference[oaicite:2]{index=2}
