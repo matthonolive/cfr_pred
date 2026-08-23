@@ -1,0 +1,33 @@
+{
+  "date": "2026-08-17",
+  "reason": "path-buffer truncation fix (Sionna PathSolver max_num_paths_per_src shared across receivers; old B256/1e6-buffer labels were +10-13 dB dark at depth)",
+  "rt": {
+    "max_depth": 10,
+    "samples_per_src": 1000000,
+    "max_num_paths_per_src": 10000000,
+    "diffuse_reflection": true,
+    "diffraction": true,
+    "edge_diffraction": true,
+    "diffraction_lit_region": true,
+    "los": true,
+    "specular_reflection": true,
+    "refraction": true,
+    "synthetic_array": false
+  },
+  "rx_batch": 32,
+  "allocator": {
+    "flush_malloc_cache_every_batches": 8,
+    "note": "2026-08-22: performance only; prevents the Dr.Jit malloc-cache creep (~6 MB/batch) from reaching the 8 GB VRAM ceiling mid-scene and triggering WDDM paging (~35x slowdown). Labels unaffected."
+  },
+  "label_grid": {
+    "fft": 256,
+    "scs_hz": 937500.0,
+    "span_mhz": 240.0
+  },
+  "dataset": {
+    "num_inpatch_scenes": 200,
+    "num_offpatch_scenes": 90,
+    "note": "shrunk from 300/120; TX lattice, features, seed, split, and hyperparameters unchanged"
+  },
+  "convergence_evidence": "rt_convergence_sweep 2026-08-17: B64 s1e6 b1e7 deep-median gap +0.28 dB (tier_small seed910007) / +0.22 dB (tier_large seed930000) vs seed-averaged solo 3e6/1e7 reference; 0 coverage flips"
+}
