@@ -55,13 +55,15 @@ import train_delta_tau as td
 from mlink.channel_tdl import (RtCfg, subcarrier_frequencies_centered,
                                compute_tdl_batch)
 
+import drjit as dr, gc
+
 # ------------------------------------------------------------------
 # 1. + 3. + 4. -- cfg overrides (mutate the module-level cfg instance
 # so every downstream reference picks them up)
 # ------------------------------------------------------------------
 V2 = dict(
     out_dir="runs/residual_cost_v2",
-    rx_batch=64,
+    rx_batch=32,
     num_inpatch_scenes=200,
     num_offpatch_scenes=90,
 )
@@ -133,6 +135,7 @@ def compute_rt_labels_v2(scene):
         wb_out[t] = wb_map
         tau_out[t] = tau_map
         print(f"    tx {t+1}/{tx_coords.shape[0]} labels done", flush=True)
+        gc.collect(); dr.sync_thread(); dr.flush_malloc_cache()
     print(f"    [v2] scene labels in {time.time() - t_scene:.0f} s "
           f"({tx_coords.shape[0]} tx)", flush=True)
     return wb_out, tau_out
