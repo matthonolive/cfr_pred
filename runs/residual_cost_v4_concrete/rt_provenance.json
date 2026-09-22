@@ -1,0 +1,75 @@
+{
+  "date": "2026-08-17",
+  "reason": "path-buffer truncation fix (Sionna PathSolver max_num_paths_per_src shared across receivers; old B256/1e6-buffer labels were +10-13 dB dark at depth)",
+  "rt": {
+    "max_depth": 10,
+    "samples_per_src": 1000000,
+    "max_num_paths_per_src": 10000000,
+    "diffuse_reflection": true,
+    "diffraction": true,
+    "edge_diffraction": true,
+    "diffraction_lit_region": true,
+    "los": true,
+    "specular_reflection": true,
+    "refraction": true,
+    "synthetic_array": false
+  },
+  "rx_batch": 32,
+  "allocator": {
+    "flush_malloc_cache_every_batches": 8,
+    "note": "2026-08-22: performance only; prevents the Dr.Jit malloc-cache creep (~6 MB/batch) from reaching the 8 GB VRAM ceiling mid-scene and triggering WDDM paging (~35x slowdown). Labels unaffected."
+  },
+  "label_grid": {
+    "fft": 256,
+    "scs_hz": 937500.0,
+    "span_mhz": 240.0
+  },
+  "dataset": {
+    "num_inpatch_scenes": 200,
+    "num_offpatch_scenes": 90,
+    "note": "shrunk from 300/120; TX lattice, features, seed, split, and hyperparameters unchanged"
+  },
+  "convergence_evidence": "rt_convergence_sweep 2026-08-17: B64 s1e6 b1e7 deep-median gap +0.28 dB (tier_small seed910007) / +0.22 dB (tier_large seed930000) vs seed-averaged solo 3e6/1e7 reference; 0 coverage flips",
+  "v3_date": "2026-09-20",
+  "v3_reason": "objective-only retrain on unchanged v2 stores: LOS residual gate removed, dB smooth-L1 primary (w_db=1.0, w_power=0.2), checkpoint on wb_mae_db",
+  "v3_evidence": "held-out paired per-link diag: exact U-Net==COST at LOS (gate), +1.19 dB shared LOS bias, RT seed-repeat floor 0.1-0.3 dB vs 1.5-2.2 dB model MAE; win at 1 wall only",
+  "v3_cfg": {
+    "out_dir": "runs/residual_cost_v3",
+    "los_gate_residual": false,
+    "w_power": 0.2,
+    "w_db": 1.0,
+    "ckpt_metric": "wb_mae_db"
+  },
+  "stores": "regenerated (not reused)",
+  "v4_date": "2026-09-21",
+  "v4_reason": "heavy-wall regime: stores regenerated with an ITU-R P.2040 material under an RT label config converged for it; sparse per-TX labels",
+  "v4_material": {
+    "name": "concrete",
+    "eps_r": 5.24,
+    "sigma_S_per_m": 0.17234224409415658,
+    "thickness_m": 0.1,
+    "f_ghz": 5.21,
+    "absorption_db_per_wall_est": 12.32
+  },
+  "v4_rt_evidence": "rt_convergence_sweep (concrete, tier_small seed910000, solo 3e6 seed-averaged reference): 3+-wall bias +5.4/+2.4/+1.3/+0.6 dB at 64/32/16/8 rx per call (1e6 rays, 1e7 buffer) = path-buffer truncation; 1e5 rays undersamples (+1.2 dB); 3e5:16:1e7 passes (+0.29 dB median, seed sd ~0.7 dB, 0 flips)",
+  "v4_probe_evidence": "8-scene concrete probe on light-wall geometry: COST-231 MAE 2.8/4.0/8.4/13.6 dB at LOS/1/2/3+ walls, all-positive bias at depth (max +40 dB); log-distance beat COST at 2 and 3+ walls",
+  "v4_cfg": {
+    "material": "concrete",
+    "eps_r": 5.24,
+    "sigma": 0.172342,
+    "thickness": 0.1,
+    "samples": 300000,
+    "rx_batch": 16,
+    "max_paths": 10000000,
+    "label_fraction": 0.5,
+    "tx_grid": 3,
+    "scenes": [
+      150,
+      60
+    ],
+    "label_fft": 256,
+    "label_scs_hz": 937500.0,
+    "r_clip_db": 80.0,
+    "flush_every": 8
+  }
+}

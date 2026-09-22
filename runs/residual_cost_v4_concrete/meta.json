@@ -1,0 +1,39 @@
+{
+  "H": 64,
+  "W": 64,
+  "K": 4,
+  "c_in": 28,
+  "y_ch": 3,
+  "y_channels": [
+    "residual_db",
+    "tau_rms_ns",
+    "coverage_logit"
+  ],
+  "parametrization": "residual_over_cost",
+  "los_gate_residual": false,
+  "nobs_los_thresh": 0.5,
+  "dataset_features": [
+    "binary_walls",
+    "electrical_distance",
+    "cost",
+    "num_obstructions",
+    "height_cond"
+  ],
+  "model_features": [
+    "binary_walls",
+    "electrical_distance",
+    "cost",
+    "num_obstructions",
+    "height_cond"
+  ],
+  "tau_target": "raw",
+  "tau_log_eps_ns": 0.001,
+  "scale_m": 0.625,
+  "frequency_hz": 5210000000.0,
+  "no_path_wb_db": 199.5,
+  "v4_material": "concrete",
+  "v4_thickness_m": 0.1,
+  "v4_label_fraction": 0.5,
+  "v4_tx_grid": 3,
+  "v4_rt_label_config": "3e+05:16:1e+07"
+}
